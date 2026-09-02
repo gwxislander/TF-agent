@@ -4486,6 +4486,8 @@ with st.sidebar:
                 st.rerun()
             # 深度学习手动入口与 Agent 共用同一份“计划 → 确认 → 执行”闭环；
             # 不再让侧栏按钮直接落入旧 run_pipeline_sync 兼容路径。
+            # 关键：这里只生成计划并把 is_running 保持为 False，让页面能显示
+            # 「确认执行提取」按钮；确认后才由 apply_system_command 置 is_running=True。
             if not use_index_mode:
                 try:
                     from agent_command_bridge import propose_inference_plan as _propose_manual_inference
@@ -4508,19 +4510,7 @@ with st.sidebar:
                 except Exception as _manual_plan_exc:
                     st.error(f"提取计划生成失败：{type(_manual_plan_exc).__name__}")
                 st.rerun()
-            _tl_add(selected_task or "unknown", "QUEUED", "提取任务已入队",
-                    status="QUEUED", tool="run_pipeline")
-            st.session_state.pending_task = {
-                "task": selected_task,
-                "prob": prob_th,
-                "cnt": min_cnt,
-                "mode": "index" if use_index_mode else "dl",
-                "points_shp": (points_shp or "").strip() if use_index_mode else None,
-                "force_rerun": bool(force_rerun),
-            }
-            st.session_state.is_running = True
-            st.session_state.stop_requested = False
-            st.rerun()
+
 
     # ---- 功能状态面板（B 阶段）：折叠、可刷新、不含敏感路径 ----
     with st.expander("功能状态", expanded=False):
