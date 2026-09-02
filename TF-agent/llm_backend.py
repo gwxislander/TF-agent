@@ -16,6 +16,51 @@ class BackendUnavailable(RuntimeError):
     pass
 
 
+# DashScope 的视觉模型命名并不统一：部分模型没有 ``vl`` 后缀。
+# 这些前缀覆盖当前项目模型选择器中已知的多模态模型；未知模型仍可
+# 通过 CSTF_LLM_SUPPORTS_VISION 显式覆盖，避免依赖名称猜测能力。
+_KNOWN_VISION_MODEL_PREFIXES = (
+    "qwen3.8",
+    "qwen3.7-flash",
+    "qwen3.7-plus",
+    "qwen3.7-max-2026-06-08",
+    "qwen3.5-ocr",
+    "qwen3.5-flash",
+    "qwen3.5-plus",
+    "qwen3-vl",
+    "qwen2.5-vl",
+    "qwen-vl",
+    "kimi-k3",
+    "kimi-k2.7-code",
+)
+
+
+def model_supports_vision(model: str) -> bool:
+    """Return the conservative built-in visual-capability classification.
+
+    A model identifier containing ``vl`` remains compatible with the original
+    behavior.  Known DashScope multimodal families are also recognized even
+    when their public identifier omits that suffix.
+    """
+    normalized = str(model or "").strip().lower()
+    return "vl" in normalized or any(
+        normalized.startswith(prefix) for prefix in _KNOWN_VISION_MODEL_PREFIXES
+    )
+
+
+def _vision_override_from_env() -> Optional[bool]:
+    """Read an explicit remote vision override, if configured."""
+    for name in ("CSTF_LLM_SUPPORTS_VISION", "CSTF_DASHSCOPE_SUPPORTS_VISION"):
+        if name not in os.environ:
+            continue
+        value = os.environ.get(name, "").strip().lower()
+        if value in {"1", "true", "yes", "on"}:
+            return True
+        if value in {"0", "false", "no", "off"}:
+            return False
+    return None
+
+
 @dataclass(frozen=True)
 class LLMBackendConfig:
     provider: str
@@ -54,7 +99,13 @@ class LLMBackendConfig:
         else:
             provider = "dashscope"
             capabilities = {"text", "tools"}
-            if "vl" in model.lower():
+            vision_override = _vision_override_from_env()
+            supports_vision = (
+                vision_override
+                if vision_override is not None
+                else model_supports_vision(model)
+            )
+            if supports_vision:
                 capabilities.add("vision")
         return cls(
             provider=provider,
@@ -109,5 +160,9 @@ def build_chat_model(
 
 
 __all__ = [
-    "BackendUnavailable", "LLMBackendConfig", "backend_status", "build_chat_model"
+    "BackendUnavailable",
+    "LLMBackendConfig",
+    "backend_status",
+    "build_chat_model",
+    "model_supports_vision",
 ]

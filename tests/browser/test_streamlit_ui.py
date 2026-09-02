@@ -69,7 +69,7 @@ def test_chat_attachment_state_stays_clear_and_uses_only_custom_tooltip():
         try:
             url = f"http://127.0.0.1:{port}/"
             with playwright.sync_playwright() as browser_api:
-                browser = browser_api.chromium.launch(headless=True)
+                browser = browser_api.chromium.launch(headless=True, args=["--no-proxy-server"])
                 page = browser.new_page()
                 deadline = time.monotonic() + 35
                 while time.monotonic() < deadline:
@@ -86,13 +86,12 @@ def test_chat_attachment_state_stays_clear_and_uses_only_custom_tooltip():
                 assert plus.get_attribute("title") is None
                 assert "每个文件≤200MB" in (plus.get_attribute("data-tooltip") or "")
 
-                plus.click()
                 with page.expect_file_chooser() as chooser_info:
-                    page.get_by_role("button", name="仅本地预览").click()
+                    plus.click()
                 chooser_info.value.set_files(str(upload))
-                page.wait_for_function(
-                    "name => document.querySelector('.cstf-plus-btn')?.dataset.tooltip?.includes(name)",
-                    arg=upload.name,
+                # afff61c 起加号气泡保持格式说明不变，选定文件名出现在预览卡片上。
+                page.locator(f'.cstf-attach-preview-card[title="{upload.name}"]').wait_for(
+                    state="visible", timeout=15000
                 )
                 page.get_by_role("textbox", name="chat_input").fill("附件状态清理回归")
                 page.get_by_role("button", name="➤").click()
@@ -102,7 +101,18 @@ def test_chat_attachment_state_stays_clear_and_uses_only_custom_tooltip():
 
                 def assert_compose_is_clear() -> None:
                     assert page.locator(".cstf-attach-bar").count() == 1
-                    assert page.locator('input[type="file"]').evaluate("el => el.files.length") == 0
+                    # afff61c 起原生 FileList 保留到提交后 rerun 轮换上传器
+                    # epoch 才清空，因此轮询等待而不是在消息回显瞬间断言。
+                    page.wait_for_function(
+                        "() => {"
+                        " const el = document.querySelector('input[type=\"file\"]');"
+                        " return !!el && el.files.length === 0;"
+                        " }",
+                        timeout=15000,
+                    )
+                    page.locator(".cstf-attach-preview-card").wait_for(
+                        state="detached", timeout=15000
+                    )
                     assert upload.name not in (plus.get_attribute("data-tooltip") or "")
                     assert plus.get_attribute("title") is None
 
@@ -110,16 +120,13 @@ def test_chat_attachment_state_stays_clear_and_uses_only_custom_tooltip():
                 page.wait_for_timeout(4200)
                 assert_compose_is_clear()
 
-                # A one-shot submit guard must not keep clearing a deliberate
-                # selection made for the next message in the same browser tab.
-                plus.click()
                 with page.expect_file_chooser() as second_chooser_info:
-                    page.get_by_role("button", name="仅本地预览").click()
+                    plus.click()
                 second_chooser_info.value.set_files(str(second_upload))
-                page.wait_for_function(
-                    "name => document.querySelector('.cstf-plus-btn')?.dataset.tooltip?.includes(name)",
-                    arg=second_upload.name,
+                page.locator(f'.cstf-attach-preview-card[title="{second_upload.name}"]').wait_for(
+                    state="visible", timeout=15000
                 )
+                assert page.locator(f'.cstf-attach-preview-card[title="{upload.name}"]').count() == 0
                 assert upload.name not in (plus.get_attribute("data-tooltip") or "")
                 assert plus.get_attribute("title") is None
 
@@ -181,7 +188,7 @@ def test_streamlit_root_and_copilot_are_visible_in_browser():
             deadline = time.monotonic() + 35
             url = f"http://127.0.0.1:{port}/"
             with playwright.sync_playwright() as browser_api:
-                browser = browser_api.chromium.launch(headless=True)
+                browser = browser_api.chromium.launch(headless=True, args=["--no-proxy-server"])
                 page = browser.new_page()
                 while time.monotonic() < deadline:
                     try:
@@ -214,22 +221,49 @@ def test_streamlit_root_and_copilot_are_visible_in_browser():
                             f"AOI button not visible: {label}; count={button.count()}, "
                             f"toolbar={globe_frame.locator('#aoiToolbar').count()}"
                         )
-                globe_frame.get_by_role("button", name="当前视图").click()
-                assert globe_frame.get_by_text("AOI 已发送，等待确认…", exact=True).is_visible()
-                # 用真实 canvas 鼠标拖拽验证矩形 AOI；坐标取点由 Cesium
-                # camera.pickEllipsoid 完成，不注入业务状态或伪造服务响应。
+                # Cesium 相机需先渲染首帧，computeViewRectangle 才可用；
+                # 因此先等 canvas 可见再触发「当前视图」。headless 下首帧
+                # 渲染耗时波动较大，等待上限与工具栏一致。
                 canvas = globe_frame.locator("#cesiumContainer canvas").first
-                canvas.wait_for(state="visible", timeout=15000)
+                canvas.wait_for(state="visible", timeout=30000)
+                globe_frame.get_by_role("button", name="当前视图").click()
+                # AOI ACK 由 globe 页面异步 fetch 返回，与其他异步断言一致使用 wait_for。
+                globe_frame.get_by_text("AOI 已选定，已同步", exact=True).wait_for(
+                    state="visible", timeout=10000
+                )
                 canvas_box = canvas.bounding_box()
                 assert canvas_box is not None
+
+                # 点击工具按钮只能进入绘制模式，不能把按钮点击本身误当成地图选择。
+                globe_frame.get_by_role("button", name="清除").click()
+                globe_frame.get_by_role("button", name="点选").click()
+                assert globe_frame.get_by_text("点选模式：点击地图选择一点", exact=True).is_visible()
+                assert "active" in (globe_frame.locator("#aoiBtnClick").get_attribute("class") or "")
+                page.mouse.click(canvas_box["x"] + canvas_box["width"] * 0.48,
+                                 canvas_box["y"] + canvas_box["height"] * 0.48)
+                globe_frame.get_by_text("AOI 已选定，已同步", exact=True).wait_for(
+                    state="visible", timeout=10000
+                )
+
+                # 用真实 canvas 鼠标验证矩形 AOI：单击不得提交，只有超过最小距离的
+                # 按下/拖拽/松开才提交。坐标取点由 Cesium camera.pickEllipsoid 完成。
+                globe_frame.get_by_role("button", name="清除").click()
                 globe_frame.get_by_role("button", name="矩形").click()
+                assert globe_frame.get_by_text("矩形模式：按住鼠标拖拽框选", exact=True).is_visible()
+                page.mouse.click(canvas_box["x"] + canvas_box["width"] * 0.45,
+                                 canvas_box["y"] + canvas_box["height"] * 0.45)
+                assert globe_frame.get_by_text("矩形模式：请按住鼠标拖拽框选", exact=True).is_visible()
+                assert "active" in (globe_frame.locator("#aoiBtnRect").get_attribute("class") or "")
                 page.mouse.move(canvas_box["x"] + canvas_box["width"] * 0.35,
                                 canvas_box["y"] + canvas_box["height"] * 0.35)
                 page.mouse.down()
                 page.mouse.move(canvas_box["x"] + canvas_box["width"] * 0.55,
                                 canvas_box["y"] + canvas_box["height"] * 0.55)
                 page.mouse.up()
-                assert globe_frame.get_by_text("AOI 已发送，等待确认…", exact=True).is_visible()
+                globe_frame.get_by_text("AOI 已选定，已同步", exact=True).wait_for(
+                    state="visible", timeout=10000
+                )
+                assert "active" not in (globe_frame.locator("#aoiBtnRect").get_attribute("class") or "")
                 globe_frame.get_by_role("button", name="多边形").click()
                 polygon_points = (
                     (canvas_box["x"] + canvas_box["width"] * 0.38,
@@ -242,7 +276,9 @@ def test_streamlit_root_and_copilot_are_visible_in_browser():
                 for point in polygon_points:
                     page.mouse.click(point[0], point[1])
                 page.mouse.click(polygon_points[0][0], polygon_points[0][1], button="right")
-                assert globe_frame.get_by_text("AOI 已发送，等待确认…", exact=True).is_visible()
+                globe_frame.get_by_text("AOI 已选定，已同步", exact=True).wait_for(
+                    state="visible", timeout=10000
+                )
 
                 fly_message = {
                     "type": "CSTF_FLY",
@@ -269,10 +305,38 @@ def test_streamlit_root_and_copilot_are_visible_in_browser():
                     state="visible", timeout=10000
                 )
                 globe_frame.get_by_role("button", name="清除").click()
-                assert globe_frame.get_by_text("AOI 已清除", exact=True).is_visible()
+                globe_frame.get_by_text("AOI 已清除", exact=True).wait_for(
+                    state="visible", timeout=10000
+                )
+                # Agent 面板默认停在「对话」视图；会话操作按钮位于「历史」视图。
+                # 浮动顶栏可能遮挡 radio 命中区，用原生 click 切换视图。
+                page.get_by_role("radio", name="历史").evaluate("el => el.click()")
+                page.get_by_role("button", name="新会话").wait_for(state="visible", timeout=10000)
                 page.get_by_role("button", name="新会话").click()
+                # 「新会话」点击后 rerun 会切回「对话」视图；等 rerun 完成
+                #（对话 radio 重新选中）再进入「历史」，避免点击落在旧 DOM 上。
+                page.wait_for_function(
+                    """() => {
+                        const group = document.querySelector('[aria-label="Agent 面板"]');
+                        if (!group) return false;
+                        const inputs = [...group.querySelectorAll('input[type="radio"]')];
+                        return inputs.length > 0 && !!inputs[0] && inputs[0].checked;
+                    }""",
+                    timeout=10000,
+                )
+                page.get_by_role("radio", name="历史").evaluate("el => el.click()")
+                page.get_by_role("button", name="清空会话").wait_for(state="visible", timeout=10000)
+                # 会话已创建后按钮才解除禁用；等 disabled 属性解除再点击。
+                page.wait_for_function(
+                    """() => {
+                        const btns = [...document.querySelectorAll('button')];
+                        const el = btns.find(b => (b.textContent || '').includes('清空会话'));
+                        return !!el && !el.disabled;
+                    }""",
+                    timeout=10000,
+                )
                 page.get_by_role("button", name="清空会话").click()
-                assert page.get_by_role("textbox", name="chat_input").is_visible()
+                page.get_by_role("textbox", name="chat_input").wait_for(state="visible", timeout=10000)
                 page.get_by_role("button", name="开始模型提取").click()
                 page.get_by_text("潮滩智能提取计划", exact=False).wait_for(state="visible", timeout=15000)
                 confirm_button = page.get_by_role("button", name="确认执行提取")
@@ -352,7 +416,7 @@ def test_gateway_login_logout_and_websocket_auth_in_browser():
     )
     try:
         with playwright.sync_playwright() as browser_api:
-            browser = browser_api.chromium.launch(headless=True)
+            browser = browser_api.chromium.launch(headless=True, args=["--no-proxy-server"])
             page = browser.new_page()
             deadline = time.monotonic() + 20
             while time.monotonic() < deadline:
@@ -468,7 +532,7 @@ def test_authenticated_gateway_proxies_real_local_streamlit_upstream():
         )
         try:
             with playwright.sync_playwright() as browser_api:
-                browser = browser_api.chromium.launch(headless=True)
+                browser = browser_api.chromium.launch(headless=True, args=["--no-proxy-server"])
                 page = browser.new_page()
                 deadline = time.monotonic() + 40
                 while time.monotonic() < deadline:

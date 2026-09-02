@@ -3,19 +3,23 @@ import re
 import base64
 import io
 import threading
+import uuid
+from contextvars import ContextVar
+from datetime import date
 from typing import Optional, Sequence
 
 # Workaround for Windows OpenMP runtime duplication from mixed scientific deps.
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 import numpy as np
+import httpx
 from dotenv import load_dotenv
 import chromadb
 from chromadb.utils import embedding_functions
 from langchain_openai import ChatOpenAI
 from langchain_core.tools import tool
 from langchain_core.messages import SystemMessage
-from langgraph.prebuilt import create_react_agent
+from langgraph.prebuilt import ToolRuntime, create_react_agent
 from llm_backend import BackendUnavailable, LLMBackendConfig, build_chat_model
 from agent_context_policy import redact_spatial_metadata, sanitize_external_text
 
@@ -33,6 +37,115 @@ load_dotenv(override=False)
 # 文献库懒加载：避免「每次打开 Copilot / 任意首轮对话」就拉 Chroma + 下载/加载 BGE（与问题内容无关）
 _kb_collection = None
 _kb_lock = threading.Lock()
+
+# 联网检索结果必须按当前调用上下文隔离。模块级 list 会让上一轮、其他会话
+# 甚至其他用户的来源串入本轮回答。ContextVar 同时兼容同步调用与异步上下文。
+_search_trace_var: ContextVar[dict] = ContextVar(
+    "cstf_search_trace",
+    default={
+        "trace_id": "",
+        "used": False,
+        "profile": "general",
+        "urls": (),
+        "results": (),
+        "failure": "",
+    },
+)
+_search_trace_registry: dict[str, dict] = {}
+_search_trace_registry_lock = threading.Lock()
+_SEARCH_TRACE_CONFIG_KEY = "cstf_search_trace_id"
+
+
+def _new_search_trace_id() -> str:
+    return uuid.uuid4().hex
+
+
+def _reset_search_trace() -> str:
+    trace_id = _new_search_trace_id()
+    _search_trace_var.set(
+        {
+            "trace_id": trace_id,
+            "used": False,
+            "profile": "general",
+            "urls": (),
+            "results": (),
+            "failure": "",
+        }
+    )
+    return trace_id
+
+
+def _set_search_trace(
+    *,
+    profile: str,
+    results: Optional[list] = None,
+    failure: str = "",
+    trace_id: Optional[str] = None,
+) -> None:
+    clean_results = tuple(
+        {
+            "title": str(item.get("title") or "").strip(),
+            "url": str(item.get("url") or "").strip(),
+        }
+        for item in (results or [])
+        if str(item.get("url") or "").strip()
+    )
+    trace = {
+        "trace_id": str(trace_id or _search_trace_var.get().get("trace_id") or ""),
+        "used": True,
+        "profile": profile,
+        "urls": tuple(item["url"] for item in clean_results),
+        "results": clean_results,
+        "failure": str(failure or "").strip(),
+    }
+    _search_trace_var.set(trace)
+    if trace["trace_id"]:
+        with _search_trace_registry_lock:
+            _search_trace_registry[trace["trace_id"]] = trace
+
+
+def _current_search_trace() -> dict:
+    return dict(_search_trace_var.get())
+
+
+def _sync_search_trace(trace_id: str) -> None:
+    """Import a tool-worker's search trace into the caller's context.
+
+    LangGraph's synchronous ToolNode executes tool calls in a worker pool, so
+    ContextVar values set by ``web_search`` are not visible in ``chat_with_vlm``.
+    The per-request registry bridges that boundary without reintroducing a
+    module-level "last result" shared by all sessions.
+    """
+    if not trace_id:
+        return
+    with _search_trace_registry_lock:
+        trace = _search_trace_registry.get(trace_id)
+    if trace is not None:
+        _search_trace_var.set(dict(trace))
+
+
+def _discard_search_trace(trace_id: str) -> None:
+    if not trace_id:
+        return
+    with _search_trace_registry_lock:
+        _search_trace_registry.pop(trace_id, None)
+
+
+def _search_invoke_config(trace_id: str) -> dict:
+    return {"configurable": {_SEARCH_TRACE_CONFIG_KEY: trace_id}}
+
+
+def _invoke_agent(executor, payload: dict, trace_id: str):
+    """Invoke an agent with trace metadata, preserving lightweight test doubles."""
+    try:
+        return executor.invoke(payload, config=_search_invoke_config(trace_id))
+    except TypeError as exc:
+        # A few callers provide minimal executor fakes that only accept the
+        # payload.  Real LangGraph executors accept ``config``; only fall back
+        # for this narrow signature mismatch, never for model/tool errors.
+        if "unexpected keyword argument 'config'" not in str(exc):
+            raise
+        return executor.invoke(payload)
 
 
 def _get_knowledge_collection():
@@ -55,6 +168,327 @@ def _get_knowledge_collection():
             embedding_function=bge_ef,
         )
         return _kb_collection
+
+
+def _normalize_url(url: str) -> str:
+    """去掉 URL 末尾常见标点，便于精确比对。"""
+    return (url or "").rstrip(".,;:!?)>]}")
+
+
+def _domain_of(url: str) -> str:
+    """提取 URL 的域名（去 www.、小写），用于同域名判定。"""
+    m = re.match(r"https?://([^/]+)", url or "")
+    if not m:
+        return ""
+    d = m.group(1).lower()
+    return d[4:] if d.startswith("www.") else d
+
+
+_URL_RE = re.compile(r"https?://[^\s\"'<>)\]\[]+")
+
+
+# 非论文/非权威来源域名黑名单（检索学术文献时应排除）
+_NON_PAPER_DOMAINS = {
+    "scholar.google.com", "github.com", "zhihu.com", "csdn.net", "blog.csdn.net",
+    "cnblogs.com", "jianshu.com", "baidu.com", "baike.baidu.com", "wikipedia.org",
+    "facebook.com", "twitter.com", "x.com", "youtube.com", "linkedin.com",
+    "researchgate.net", "semanticscholar.org", "arxiv.org", "researcher.life",
+    "ijcesen.com", "ijcaonline.org", "frontiersin.org", "sciopen.com",
+    "preprints.org", "biorxiv.org", "medrxiv.org", "ssrn.com", "openreview.net",
+    "wepub.org", "u.osu.edu", "scirp.org", "hindawi.com", "omicsonline.org",
+    "huggingface.co", "patents.google.com",
+}
+_NON_PAPER_PATH_MARKERS = (
+    "/commit/", "/blob/", "/tree/", "/supplement/", ".diff",
+)
+_GOVERNMENT_QUERY_RE = re.compile(
+    r"(政策|法规|条例|规划|通知|办法|意见|政府|自然资源厅|生态环境厅|"
+    r"发展改革委|人民政府|gov\.cn|policy|regulation|official|government|"
+    r"department|ministry)",
+    re.IGNORECASE,
+)
+_ACADEMIC_QUERY_RE = re.compile(
+    r"(论文|文献|研究|期刊|会议|综述|语义分割|深度学习|遥感|"
+    r"paper|literature|journal|conference|review|semantic\s+segmentation|remote\s+sensing)",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_paper(url: str, title: str = "") -> bool:
+    """判断一条检索结果是否像真实论文/期刊文章（而非学者主页、代码库、博客等）。"""
+    dom = _domain_of(url)
+    # 后缀匹配：zhuanlan.zhihu.com 这类子域名也能命中 zhihu.com
+    for bad in _NON_PAPER_DOMAINS:
+        if dom == bad or dom.endswith("." + bad):
+            return False
+    if "citations?user=" in (url or ""):
+        return False
+    # 个人主页常见路径特征
+    for marker in ("/publications", "/citations", "/profile", "/author", "personal"):
+        if marker in (url or ""):
+            return False
+    lowered_url = (url or "").lower()
+    if any(marker in lowered_url for marker in _NON_PAPER_PATH_MARKERS):
+        return False
+    lowered_title = (title or "").strip().lower()
+    if not lowered_title or lowered_title.startswith("http://") or lowered_title.startswith("https://"):
+        return False
+    return True
+
+
+def _search_profile(query: str) -> str:
+    """Classify a search so policy queries are not forced through paper filters."""
+    text = str(query or "")
+    if _GOVERNMENT_QUERY_RE.search(text):
+        return "government"
+    if _ACADEMIC_QUERY_RE.search(text):
+        return "academic"
+    return "general"
+
+
+def _government_domains_for_query(query: str) -> list[str]:
+    text = str(query or "")
+    if "浙江" in text:
+        return ["zj.gov.cn"]
+    return ["gov.cn"]
+
+
+def _is_government_source(url: str, query: str) -> bool:
+    domain = _domain_of(url)
+    allowed = _government_domains_for_query(query)
+    return any(domain == item or domain.endswith("." + item) for item in allowed)
+
+
+def _dedupe_search_results(results: list) -> list:
+    deduped = []
+    seen = set()
+    for item in results or []:
+        if not isinstance(item, dict):
+            continue
+        url = _normalize_url(str(item.get("url") or "").strip())
+        content = str(item.get("content") or "").strip()
+        if not url or not content or url in seen:
+            continue
+        seen.add(url)
+        copied = dict(item)
+        copied["url"] = url
+        deduped.append(copied)
+    return deduped
+
+
+def _flag_unverified_urls(reply: str, verified_urls: list) -> str:
+    """后处理校验：把回答中不在真实检索结果里的 URL 标记为「待核实」。
+
+    - 精确匹配真实 URL → 保留不动
+    - 域名命中真实 URL 但链接细节不同 → 标「链接待核实」
+    - 域名都不命中 → 标「来源待核实」
+    - 含 [SYSTEM_COMMAND_JSON] 命令块的回复不做校验（那是系统指令，不是文献引用）
+    """
+    if not reply or "[SYSTEM_COMMAND_JSON]" in reply:
+        return reply
+    verified = {_normalize_url(u) for u in verified_urls if u}
+    verified_domains = {_domain_of(u) for u in verified_urls if u}
+
+    def _cb(m):
+        raw = m.group(0)
+        if _normalize_url(raw) in verified:
+            return raw
+        dom = _domain_of(raw)
+        if dom and dom in verified_domains:
+            return raw + " ⚠️[链接待核实]"
+        return raw + " ⚠️[来源待核实]"
+
+    return _URL_RE.sub(_cb, reply)
+
+
+_REF_SECTION_HEADING_RE = re.compile(
+    r"(?im)^\s*(?:#{1,6}\s*)?(?:\*{1,2})?"
+    r"(?:参考来源|参考文献|references)"
+    r"(?:\*{1,2})?\s*(?:[：:].*)?$"
+)
+
+
+def _build_verified_reference_list(results: list) -> str:
+    """根据真实检索结果，程序化生成参考来源清单（标题 + URL 一一对应，绝不编造）。"""
+    if not results:
+        return ""
+    entries = []
+    for i, item in enumerate(results, 1):
+        title = (item.get("title") or "").strip()
+        url = (item.get("url") or "").strip()
+        entries.append(f"[{i}] {title}" + (f" — {url}" if url else ""))
+    header = "---\n\n**参考来源**（由系统据本次检索真实结果生成，编号与正文 [n] 对应）：\n"
+    return header + "\n\n".join(entries)
+
+
+def _strip_llm_reference_section(reply: str) -> str:
+    """Strip only a trailing LLM-generated reference section.
+
+    A user may legitimately ask the answer to begin with the literal text
+    ``参考文献``.  The old substring search cut the entire answer at index 0.
+    We now require a line-level heading after substantive body text, with a
+    numbered item or URL following it.
+    """
+    if not reply:
+        return reply
+    matches = list(_REF_SECTION_HEADING_RE.finditer(reply))
+    for match in reversed(matches):
+        before = reply[: match.start()].strip()
+        after = reply[match.end() :]
+        if len(before) < 24:
+            continue
+        if not (re.search(r"(?m)^\s*\[?\d+\]?", after) or _URL_RE.search(after)):
+            continue
+        return before
+    return reply
+
+
+def _finalize_search_reply(reply: str) -> str:
+    """Apply citation post-processing only to a search performed this turn."""
+    trace = _current_search_trace()
+    text = str(reply or "").strip()
+    if not trace.get("used"):
+        return text
+    results = list(trace.get("results") or [])
+    if not results:
+        return str(trace.get("failure") or text).strip()
+    text = _strip_llm_reference_section(text)
+    text = _flag_unverified_urls(text, list(trace.get("urls") or []))
+    references = _build_verified_reference_list(results)
+    return text + references if references else text
+
+
+def _web_search_tavily(
+    query: str,
+    max_results: int = 12,
+    search_depth: str = "advanced",
+    *,
+    trace_id: Optional[str] = None,
+) -> str:
+    """调用 Tavily Search API 进行联网检索，返回带来源的上下文字符串。
+
+    - search_depth: basic（快）/ advanced（更全更相关，默认）
+    - 无 TAVILY_API_KEY 时优雅降级：返回明确提示，不抛异常、不阻断对话。
+    """
+    profile = _search_profile(query)
+    api_key = os.environ.get("TAVILY_API_KEY", "").strip()
+    if not api_key:
+        message = (
+            "【联网搜索未启用】当前未配置 TAVILY_API_KEY 环境变量，无法进行联网检索。"
+            "请在 .env 中配置 TAVILY_API_KEY 后重试，或改用本地知识库。"
+        )
+        _set_search_trace(profile=profile, failure=message, trace_id=trace_id)
+        return message
+
+    try:
+        payload = {
+            "api_key": api_key,
+            "query": query,
+            "max_results": max_results,
+            "search_depth": search_depth,
+            "include_raw_content": False,
+            "topic": "general",
+        }
+        if profile == "academic":
+            payload["exclude_domains"] = sorted(_NON_PAPER_DOMAINS)
+        elif profile == "government":
+            payload["include_domains"] = _government_domains_for_query(query)
+        resp = httpx.post(
+            "https://api.tavily.com/search",
+            json=payload,
+            timeout=30.0,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as exc:
+        message = f"【联网搜索失败】调用 Tavily 出错：{type(exc).__name__}。请稍后重试，或改用本地知识库。"
+        _set_search_trace(profile=profile, failure=message, trace_id=trace_id)
+        return message
+
+    results = _dedupe_search_results(data.get("results") or [])
+    if profile == "academic":
+        results = [
+            item
+            for item in results
+            if _looks_like_paper(item.get("url") or "", item.get("title") or "")
+        ]
+    elif profile == "government":
+        results = [
+            item
+            for item in results
+            if _is_government_source(item.get("url") or "", query)
+        ]
+    if not results:
+        if profile == "government":
+            message = (
+                "联网搜索未返回符合政府官网约束的可核实结果。"
+                "不能据此断言相关政策不存在、尚未发布或仍然有效；请调整关键词后重试。"
+            )
+        elif profile == "academic":
+            message = (
+                "联网搜索未返回可用的论文结果（已过滤代码库、模型仓库、专利、博客和补充材料等非论文来源），"
+                "请调整关键词后重试。"
+            )
+        else:
+            message = "联网搜索未返回可核实结果，请调整关键词后重试。"
+        _set_search_trace(profile=profile, failure=message, trace_id=trace_id)
+        return message
+
+    _set_search_trace(profile=profile, results=results, trace_id=trace_id)
+
+    if profile == "government":
+        parts = ["【系统从政府官网检索到的可核实资料如下】："]
+    elif profile == "academic":
+        parts = ["【系统从互联网检索到的学术资料如下，请仅依据这些真实结果作答】："]
+    else:
+        parts = ["【系统从互联网检索到的可核实资料如下，请注意甄别】："]
+    for i, item in enumerate(results, 1):
+        title = (item.get("title") or "").strip()
+        url = (item.get("url") or "").strip()
+        content = (item.get("content") or "").strip()
+        score = item.get("score")
+        if not content:
+            continue
+        parts.append(f"结果 {i}：{title}" + (f"（来源: {url}）" if url else ""))
+        if score is not None:
+            parts.append(f"  相关度: {score:.2f}")
+        parts.append(f"  摘要: {content}")
+    if profile == "academic":
+        parts.append(
+            "请基于以上真实论文结果作答，并在正文中用 [n] 标注引用。"
+            "优先归纳方法、年份、来源和适用性；不得补写检索结果中没有的作者、期刊、方法或数值。"
+            "不要自行生成参考来源清单，系统会按本轮真实结果追加。"
+        )
+    elif profile == "government":
+        parts.append(
+            "请只依据以上政府官网结果回答，并在正文中用 [n] 标注引用。"
+            "不得把高校环评、商业转载、外省文件或第三方解读当作浙江省政府政策。"
+            "如果结果不足，必须明确说无法核实；不得据此断言政策不存在、尚未发布或仍然有效。"
+            "不要自行生成参考来源清单，系统会按本轮真实结果追加。"
+        )
+    else:
+        parts.append(
+            "请只依据以上真实结果回答，并在正文中用 [n] 标注引用。"
+            "信息不足时明确说明无法核实，不得编造最新事实。"
+            "不要自行生成参考来源清单，系统会按本轮真实结果追加。"
+        )
+    return "\n".join(parts)
+
+
+@tool
+def web_search(query: str, runtime: ToolRuntime) -> str:
+    """
+    【联网搜索工具】
+    当用户询问的是「通用知识、时事动态、概念解释」等本地知识库覆盖不到的内容时调用；
+    也用于本地文献库未命中时的兜底。参数 `query` 为一句自然语言检索问句（而非零散关键词）。
+    检索学术/文献/论文类问题时，优先用英文关键词（如 remote sensing semantic segmentation），
+    以获取更多英文期刊与会议论文。
+    """
+    print(f"\n[Agent 后台动作] 🌐 正在联网搜索：{query}")
+    config = getattr(runtime, "config", {}) or {}
+    configurable = config.get("configurable", {}) if isinstance(config, dict) else {}
+    trace_id = configurable.get(_SEARCH_TRACE_CONFIG_KEY)
+    return _web_search_tavily(query, trace_id=trace_id)
 
 
 @tool
@@ -597,7 +1031,7 @@ tools = [
     trigger_spatial_analysis,
     change_map_view,
     assist_gee_download,
-    search_knowledge_base,
+    web_search,
 ]
 
 # ==========================================
@@ -615,7 +1049,8 @@ system_prompt_base = """你是 CSTF-Copilot，遥感潮滩分析平台的对话�
 ═══════════════════════════════════════
 第一步 · 意图分类（每轮必做，可多标签）
 ═══════════════════════════════════════
-A. 纯问答 / 文献 / 图片解译 → 只回答或 search_knowledge_base，**禁止** dispatch_system_command
+A. 纯问答 / 文献 / 图片解译 → 只回答或 web_search，**禁止** dispatch_system_command
+   一律用 web_search 联网检索（文献/法规/公式/通用知识/时事/概念都走它）
 B. 只改侧栏、不立即运行 → dispatch_system_command，**不要** pending_action
    例：「概率改成 8%」「把 E1 打开」「切到下载页」「云量设 20」
 C. 改侧栏并立即运行 → dispatch_system_command，sidebar_states + pending_action 同轮给出
@@ -662,7 +1097,7 @@ I. **端到端潮滩分析 Workflow（GEE→推理→E1/M5→PDF）**
 - change_map_view：仅当地图跳转且无任何侧栏/运行需求时用
 - assist_gee_download：用户明确要 GEE 下载时可快捷调用（等价于 dispatch + run_m4）
 - trigger_spatial_analysis：仅简单跑推理且无 M5/E1/Tab 变更时用
-- search_knowledge_base：文献、法规、方法原理类问题
+- web_search：文献/法规/公式/通用知识/时事/概念一律走联网实时检索（带来源 URL）
 
 调用后必须在回复**末尾原样附上**工具返回的 [SYSTEM_COMMAND_JSON]...[/SYSTEM_COMMAND_JSON] 块。
 
@@ -957,10 +1392,16 @@ def chat_with_vlm(
     sidebar_context: str = None,
     capability_summary: str = None,
     allow_spatial_metadata: bool = False,
-    allow_external_media: bool = False,
+    # Keep the original main.py contract: image-bearing callers that do not
+    # pass a consent flag still send the selected image to the active model.
+    # Callers that need a local-only preview can explicitly pass False.
+    allow_external_media: bool = True,
     image_paths: Optional[Sequence[str]] = None,
 ) -> str:
     """处理对话，完美支持多模态视觉能力与物理感知"""
+    # Each user turn owns its search/citation trace.  This prevents references
+    # from a previous question or another concurrent session leaking here.
+    search_trace_id = _reset_search_trace()
 
     def _model_text(value: object, *, limit: int = 4000) -> str:
         """Normalize every caller-provided text before it enters model context."""
@@ -983,8 +1424,9 @@ def chat_with_vlm(
     if len(requested_image_paths) > 6:
         return "单轮最多支持 6 张图片附件，请减少选择数量后重试。"
 
-    # UI 之外的调用者也必须显式获得本轮媒体授权，避免把上传影像
-    # 误送到外部 VLM；文本问答不受此门闩影响。
+    # Explicit False remains available for local-only previews and for callers
+    # that intentionally enforce their own media-consent boundary.  The
+    # default stays permissive for compatibility with the original main.py.
     if requested_image_paths and not allow_external_media:
         return "当前会话未授权向外部模型发送影像内容；请先在会话设置中勾选影像发送授权。"
 
@@ -1027,7 +1469,13 @@ def chat_with_vlm(
             return f"纯问答后端调用失败：{type(exc).__name__}。请检查本地模型服务状态。"
 
     task_list_str = ", ".join(_model_text(task, limit=240) for task in (available_tasks or [])) or "目前硬盘中没有任何数据"
-    dynamic_prompt = system_prompt_base + f"\n\n【🚨 硬盘可用任务目录（唯一合法 task 名来源）】\n{task_list_str}"
+    _d_today = date.today()
+    dynamic_prompt = (
+        system_prompt_base
+        + f"\n\n【系统当前日期】{_d_today.strftime('%Y-%m-%d')}（当前年份 {_d_today.year} 年。"
+        "计算“近两年/近三年/近五年”等时间范围、以及构造检索关键词时，必须以此日期为基准，不要使用你记忆中的年份）"
+        + f"\n\n【🚨 硬盘可用任务目录（唯一合法 task 名来源）】\n{task_list_str}"
+    )
     if sidebar_context and sidebar_context.strip():
         dynamic_prompt += "\n\n" + _model_text(sidebar_context)
     if dataset_catalog_text and dataset_catalog_text.strip():
@@ -1089,7 +1537,7 @@ def chat_with_vlm(
         messages.append({"role": "user", "content": _model_text(user_input)})
 
     try:
-        response = executor.invoke({"messages": messages})
+        response = _invoke_agent(executor, {"messages": messages}, search_trace_id)
     except Exception as e:
         if (
             existing_image_paths
@@ -1121,11 +1569,16 @@ def chat_with_vlm(
                     "content": retry_content,
                 }
             ]
-            response = executor.invoke({"messages": retry_messages})
+            response = _invoke_agent(
+                executor,
+                {"messages": retry_messages},
+                search_trace_id,
+            )
         else:
             raise
     output_messages = response["messages"]
-    final_reply = output_messages[-1].content
+    _sync_search_trace(search_trace_id)
+    final_reply = str(output_messages[-1].content or "")
 
     for msg in output_messages:
         if msg.type == "tool" and (
@@ -1133,27 +1586,35 @@ def chat_with_vlm(
             or "COMMAND_RUN_PIPELINE" in str(msg.content)
             or "COMMAND_UPDATE_MAP" in str(msg.content)
         ):
-            return final_reply + "\n" + str(msg.content)
+            result = _finalize_search_reply(final_reply) + "\n" + str(msg.content)
+            _discard_search_trace(search_trace_id)
+            return result
 
     if "COMMAND_SEARCH_KNOWLEDGE_BASE" in final_reply:
-        print("\n🚨 [后台监控] 截获到大模型的查库暗号！正在悄悄执行检索...")
+        print("\n🚨 [后台监控] 截获到大模型的检索暗号！改为联网搜索...")
 
         match = re.search(r"COMMAND_SEARCH_KNOWLEDGE_BASE[\|:：\s]*(.*)", final_reply)
         keywords = match.group(1).strip() if match and match.group(1).strip() else user_input
         keywords = keywords.strip("。.,!！")
 
-        retrieved_info = search_knowledge_base.invoke(keywords)
-        print(f"✅ [后台监控] 查库完成，正在强迫大模型结合文献重新作答...\n")
+        retrieved_info = _web_search_tavily(keywords)
+        print(f"✅ [后台监控] 联网搜索完成，正在强迫大模型结合检索结果重新作答...\n")
 
         messages.append({"role": "assistant", "content": final_reply})
         messages.append(
             {
                 "role": "user",
-                "content": f"系统已自动从后台为您查阅了本地数据库，检索结果如下：\n{retrieved_info}\n请仔细阅读上述文献，直接回答我最初的问题。回答必须专业严谨，且在文末标注'(来源: XXX)'。严禁在本次回答中再输出 COMMAND 暗号。",
+                "content": f"系统已自动联网检索，结果如下：\n{retrieved_info}\n请仔细阅读上述资料，直接回答我最初的问题。回答必须专业严谨，且在文末标注来源 URL。严禁在本次回答中再输出 COMMAND 暗号。",
             }
         )
 
-        response_phase2 = executor.invoke({"messages": messages})
-        return response_phase2["messages"][-1].content
+        response_phase2 = _invoke_agent(executor, {"messages": messages}, search_trace_id)
+        _sync_search_trace(search_trace_id)
+        result = _finalize_search_reply(response_phase2["messages"][-1].content)
+        _discard_search_trace(search_trace_id)
+        return result
 
-    return final_reply
+    try:
+        return _finalize_search_reply(final_reply)
+    finally:
+        _discard_search_trace(search_trace_id)

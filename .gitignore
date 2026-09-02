@@ -106,3 +106,6 @@ scan_tidal_data.py
 # Acceptance test outputs (regenerated locally)
 tests/acceptance/_out/
 acceptance_matrix.json
+
+# Local research release artifacts (kept out of the project push)
+docs/research/

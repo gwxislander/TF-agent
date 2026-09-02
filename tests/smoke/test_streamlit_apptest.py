@@ -130,13 +130,10 @@ def test_chat_uploader_accepts_multiple_files_and_clears_after_submit(tmp_path, 
     assert "second.png" in captions
 
 
-def test_media_consent_is_available_before_attachment_form_submission(tmp_path, monkeypatch):
-    """附件授权必须在提交前就存在，不能依赖表单内文件选择触发 rerun。"""
+def test_attachment_is_sent_by_default_without_consent_widget(tmp_path, monkeypatch):
+    """恢复原 main：附件直接随当前模型请求发送，不再显示授权控件。"""
     at = _run_app(tmp_path, monkeypatch)
-    consent = next(
-        item for item in at.checkbox if item.label == "附件外发授权（仅本轮）"
-    )
-    consent.set_value(True)
+    assert not any(item.label == "附件外发授权（仅本轮）" for item in at.checkbox)
     uploader = next(item for item in at.file_uploader if item.label == "chat_attach")
     uploader.set_value(("authorized.png", _PNG_1X1, "image/png"))
     next(item for item in at.text_input if item.label == "chat_input").set_value("分析附件")

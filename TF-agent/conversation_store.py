@@ -18,7 +18,6 @@ from agent_context_policy import redact_spatial_metadata, sanitize_external_text
 
 SCHEMA_VERSION = 2
 _COMMAND_RE = re.compile(r"\[SYSTEM_COMMAND_JSON\].*?\[/SYSTEM_COMMAND_JSON\]", re.I | re.S)
-_ABS_PATH_RE = re.compile(r"(?:[A-Za-z]:[\\/]|\\\\|/(?:Users|home|private|tmp|var|opt)/)\S*")
 _SECRET_RE = re.compile(
     r"(?i)(?:api[_-]?key|token|secret|password|authorization)\s*[:=]\s*[^\s,;，；]+"
 )
@@ -93,9 +92,10 @@ def _safe_content(content: Any) -> str:
     text = _COMMAND_RE.sub("[系统命令已执行，历史记录不可重放]", text)
     text = _SECRET_RE.sub("<redacted>", text)
     text = _URL_CREDENTIAL_RE.sub(r"\1<redacted>@", text)
-    text = _ABS_PATH_RE.sub("<local-path>", text)
     # Also catch provider key prefixes when users paste a bare key without a
     # field name (for example ``sk-...``).
+    # Absolute paths are handled by the shared sanitizer, which preserves
+    # ordinary http/https/ftp links while redacting local filesystem paths.
     text = sanitize_external_text(text)
     # AOI/map coordinates are not needed for local history display and must not
     # re-enter a later external-model context through persisted messages.
@@ -277,22 +277,31 @@ class ConversationStore:
             out.append(item)
         return out
 
-    def list_threads(self, limit: int = 50, *, include_empty: bool = True) -> List[Dict[str, Any]]:
-        """Return recent sessions with a bounded, already-redacted preview.
+    def list_threads(self, limit: Optional[int] = 50, *, include_empty: bool = True) -> List[Dict[str, Any]]:
+        """Return recent sessions with an already-redacted preview.
+
+        ``limit=None`` intentionally disables the query-level count limit for
+        navigation views.  The UI can then keep every visible session while
+        constraining only the viewport with an internal scrollbar.
 
         The session list is a navigation projection only: it exposes no raw
         message payload, attachment bytes, or execution command text.  The
         preview is read from the sanitized ``messages.content`` column and is
         truncated again for the UI boundary.
         """
-        try:
-            safe_limit = int(limit)
-        except (TypeError, ValueError):
-            safe_limit = 50
-        safe_limit = max(1, min(safe_limit, 100))
+        if limit is None:
+            safe_limit = None
+        else:
+            try:
+                safe_limit = int(limit)
+            except (TypeError, ValueError):
+                safe_limit = 50
+            safe_limit = max(1, min(safe_limit, 100))
         _nonempty_filter = "" if include_empty else (
             "HAVING SUM(CASE WHEN m.role = 'user' THEN 1 ELSE 0 END) > 0"
         )
+        _limit_clause = "" if safe_limit is None else "LIMIT ?"
+        _query_params = () if safe_limit is None else (safe_limit,)
         with self._lock, self._connect() as conn:
             rows = conn.execute(
                 f"""
@@ -313,9 +322,9 @@ class ConversationStore:
                 GROUP BY s.thread_id, s.created_at, s.last_seen
                 {_nonempty_filter}
                 ORDER BY s.last_seen DESC, s.thread_id DESC
-                LIMIT ?
+                {_limit_clause}
                 """,
-                (safe_limit,),
+                _query_params,
             ).fetchall()
         out = []
         for row in rows:

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
 import sys
 import unittest
 from unittest import mock
@@ -75,6 +76,17 @@ class TestSafeModelLoading(unittest.TestCase):
             torch.save({"backbone.conv1.weight": torch.zeros(2, 2)}, p)
             state = torch.load(p, map_location="cpu", weights_only=True)
             self.assertEqual(list(state.keys()), ["backbone.conv1.weight"])
+
+
+class TestCIInstallDependencies(unittest.TestCase):
+    def test_ci_installs_app_and_model_import_dependencies(self):
+        ci_path = Path(__file__).resolve().parents[2] / ".github" / "workflows" / "ci.yml"
+        ci_text = ci_path.read_text(encoding="utf-8")
+        start = ci_text.index("pip install numpy")
+        end = ci_text.index("pip install -r requirements-test.txt", start)
+        install_block = ci_text[start:end]
+        for dependency in ("leafmap", "streamlit-folium", "einops"):
+            self.assertIn(dependency, install_block)
 
 
 # ============================================================

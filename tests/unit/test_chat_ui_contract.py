@@ -54,6 +54,31 @@ class TestChatUiContract(unittest.TestCase):
         self.assertIn('st.caption("暂无历史会话")', self.source)
         self.assertIn('_conv_c1, _conv_c2 = st.columns(2)', self.source)
 
+    def test_history_session_list_has_no_fixed_count_limit_and_scrolls(self):
+        """历史会话不按固定条数截断，超过面板高度时只在列表框内滚动。"""
+        self.assertIn("list_threads(\n                limit=None,", self.source)
+        self.assertNotIn("list_threads(\n                limit=8,", self.source)
+        self.assertIn("cstf-history-list-marker", self.source)
+        self.assertIn('[data-testid="stLayoutWrapper"]:has(.cstf-history-list-marker)', self.source)
+        self.assertIn("overflow-y: auto !important;", self.source)
+
+    def test_history_list_frame_stays_fixed_while_items_scroll(self):
+        """列表边框固定在滚动视口，不能随内部会话项一起滚动。"""
+        frame_selector = (
+            'div[data-testid="stColumn"]:has(.cstf-agent-view-history) '
+            '[data-testid="stLayoutWrapper"]:has(.cstf-history-list-marker) {'
+        )
+        frame_css = self.source.split(frame_selector, 1)[1].split("}", 1)[0]
+        self.assertIn("border: 1px solid", frame_css)
+
+        inner_selector = (
+            'div[data-testid="stColumn"]:has(.cstf-agent-view-history) '
+            '[data-testid="stLayoutWrapper"]:has(.cstf-history-list-marker) '
+            '> [data-testid="stVerticalBlock"] {'
+        )
+        inner_css = self.source.split(inner_selector, 1)[1].split("}", 1)[0]
+        self.assertIn("border: 0 !important;", inner_css)
+
     def test_status_log_panel_is_below_map_and_adjustable(self):
         """状态/日志移到地图下方，并提供可收起与高度调节。"""
         self.assertIn('cstf-map-status-zone', self.source)
@@ -93,14 +118,127 @@ class TestChatUiContract(unittest.TestCase):
         self.assertIn('data-testid="stFileUploader"] {', self.source)
         self.assertIn("flex-direction: row !important;", self.source)
         self.assertIn("order: 2 !important;", self.source)
-        self.assertIn('data-media-mode="local"', self.source)
-        self.assertIn('data-media-mode="external"', self.source)
+        self.assertIn("fileInput.click();", self.source)
+        self.assertNotIn('data-media-mode="local"', self.source)
+        self.assertNotIn('data-media-mode="external"', self.source)
+        self.assertNotIn("cstf-attach-choice", self.source)
         self.assertIn("fileInput.value = '';", self.source)
-        self.assertIn("win.setTimeout(clearSelectedFileUi, 60);", self.source)
+        self.assertNotIn("win.setTimeout(clearSelectedFileUi", self.source)
         self.assertIn("__cstfAttachmentLastEpoch", self.source)
         self.assertIn("attachmentEpochChanged", self.source)
         self.assertIn("__cstfAttachmentReconciler", self.source)
         self.assertIn("setInterval(reconcileAttachment", self.source)
+
+    def test_attachment_preview_supports_all_formats_and_keeps_tooltip_static(self):
+        """上传阶段显示预览；文件名不能污染固定的加号格式提示。"""
+        self.assertIn("cstf-attach-preview", self.source)
+        self.assertIn("URL.createObjectURL(file)", self.source)
+        self.assertIn("image/tiff", self.source)
+        self.assertIn("cstf-attach-preview-clear", self.source)
+        self.assertIn("plusBtn.dataset.tooltip = defaultTooltip", self.source)
+        self.assertNotIn("const described =", self.source)
+        self.assertNotIn("const names = files.slice(0, 3)", self.source)
+
+    def test_attachment_previews_are_arranged_in_one_horizontal_row(self):
+        """多个附件预览应并排显示，超出宽度时仅预览条横向滚动。"""
+        start = self.source.index(".cstf-attach-preview {")
+        end = self.source.index(".cstf-attach-preview.is-visible", start)
+        preview_css = self.source[start:end]
+        self.assertIn("flex-direction: row !important;", preview_css)
+        self.assertIn("flex-wrap: nowrap !important;", preview_css)
+        self.assertIn("width: auto !important;", preview_css)
+        self.assertIn("min-width: 0 !important;", preview_css)
+        self.assertIn("overflow-x: auto !important;", preview_css)
+
+    def test_attachment_previews_stay_inside_compose_box(self):
+        """预览条应在聊天输入外框内展开，不能漂浮到外框上方。"""
+        start = self.source.index(".cstf-attach-preview {")
+        end = self.source.index(".cstf-attach-preview.is-visible", start)
+        preview_css = self.source[start:end]
+        self.assertIn("top: 8px !important;", preview_css)
+        self.assertIn("bottom: auto !important;", preview_css)
+        self.assertIn("left: 10px !important;", preview_css)
+        self.assertIn("right: 10px !important;", preview_css)
+        self.assertIn("min-width: 0 !important;", preview_css)
+        self.assertIn("max-width: none !important;", preview_css)
+        self.assertIn(".cstf-chat-compose .cstf-attach-bar", self.source)
+        self.assertIn("position: static !important;", self.source)
+        self.assertIn(".cstf-chat-compose:has(.cstf-attach-preview.is-visible)", self.source)
+        self.assertIn("padding-top: 5.8rem !important;", self.source)
+
+    def test_attachment_selection_accumulates_across_chooser_rounds(self):
+        """连续打开选择器时，附件应累积到同一个原生 FileList。"""
+        self.assertIn("selectedFiles", self.source)
+        self.assertIn("new win.DataTransfer()", self.source)
+        self.assertIn("transfer.items.add(file)", self.source)
+        self.assertIn("fileInput.files = transfer.files", self.source)
+        self.assertIn("selectedFilesSyncing", self.source)
+        self.assertIn("dispatchEvent(new win.Event('change'", self.source)
+        self.assertIn("mergeSelectedFiles", self.source)
+        self.assertIn("syncAttach([])", self.source)
+
+    def test_attachment_first_selection_does_not_dispatch_duplicate_change(self):
+        """首轮原生 change 已包含文件，不应再合成一次相同变更。"""
+        self.assertIn("const priorSelectionCount = selectedFiles.length", self.source)
+        self.assertIn("const shouldNotify = priorSelectionCount > 0", self.source)
+        self.assertIn("selectedFiles.length > priorSelectionCount", self.source)
+        self.assertIn("assignSelectedFiles(selectedFiles, shouldNotify)", self.source)
+        self.assertIn("fileInput.addEventListener('change', (event) =>", self.source)
+        self.assertIn("event.stopImmediatePropagation()", self.source)
+        self.assertIn("2026-08-23-attachment-v7", self.source)
+
+    def test_attachment_submit_clear_survives_epoch_rotation_and_preview_sync_is_idempotent(self):
+        """提交清空跨 uploader epoch 生效，轮询同步不能反复重建同一预览。"""
+        self.assertIn("win.__cstfAttachmentClearRequested = true", self.source)
+        self.assertIn("const mustRemainCleared =", self.source)
+        self.assertIn("Boolean(\n                win.__cstfAttachmentClearRequested", self.source)
+        self.assertIn("? (mustRemainCleared ? []", self.source)
+        self.assertIn("let renderedPreviewSignature = null", self.source)
+        self.assertIn("if (previewSignature === renderedPreviewSignature) return;", self.source)
+        self.assertNotIn("delete win.__cstfAttachmentPendingEpoch", self.source)
+
+    def test_attachment_file_identity_ignores_unstable_last_modified_timestamp(self):
+        """浏览器重建 File 时的动态时间戳不能触发重复预览或重复附件。"""
+        start = self.source.index("const fileIdentity =")
+        end = self.source.index("const assignSelectedFiles", start)
+        identity_code = self.source[start:end]
+        self.assertIn("String(file?.type || '')", identity_code)
+        self.assertNotIn("file?.lastModified", identity_code)
+
+    def test_attachment_submit_keeps_native_file_until_server_rotates_uploader(self):
+        """发送时可立即隐藏预览，但不能先清空原生 FileList。"""
+        start = self.source.index("const handleSendClick =")
+        end = self.source.index("const destroy =", start)
+        submit_bridge = self.source[start:end]
+        self.assertIn("renderAttachmentPreview([])", submit_bridge)
+        self.assertIn("_attachment_uploader_epoch", self.source)
+        self.assertNotIn("clearSelectedFileUi", submit_bridge)
+        self.assertNotIn("fileInput.value = ''", submit_bridge)
+
+    def test_uploaded_attachment_batch_is_deduplicated_before_submission(self):
+        """前端重复 change 即使抵达服务端，也不能复制同一附件消息。"""
+        self.assertIn("def _dedupe_uploaded_images", self.source)
+        self.assertIn(
+            "uploaded_images = _dedupe_uploaded_images(uploaded_images)",
+            self.source,
+        )
+
+    def test_map_ready_warning_waits_until_fly_ack_is_known(self):
+        """地图已收到定位确认时，不应保留发送前的未就绪提示。"""
+        self.assertIn("_map_ready_warning = False", self.source)
+        self.assertIn("if _ack is None and _map_ready_warning:", self.source)
+        self.assertIn(
+            '_globe_srv.map_protocol_state(\n                                channel_id=_map_channel_id',
+            self.source,
+        )
+        self.assertIn(
+            'channel_id=st.session_state.get("_map_channel_id")',
+            self.source,
+        )
+        self.assertIn(
+            '_globe_srv.wait_map_ack(\n                                _fly_payload.get("command_id", ""),',
+            self.source,
+        )
 
     def test_resize_handles_show_only_the_blue_drag_bar(self):
         """拖动命中区不能带浏览器焦点外框或额外边框。"""
@@ -148,7 +286,35 @@ class TestChatUiContract(unittest.TestCase):
         self.assertIn('handle.setAttribute("aria-valuemax", "48")', self.source)
         self.assertIn('handle.setAttribute("aria-valuemin", "192")', self.source)
         self.assertIn('handle.setAttribute("aria-valuemax", "392")', self.source)
+
+    def test_resized_columns_remain_responsive_after_viewport_changes(self):
+        """拖动后列宽不能写死像素，否则窗口变化会把一列挤到视口外。"""
+        self.assertIn("flex-wrap: nowrap !important;", self.source)
+        self.assertIn('setImp(pair[0], "width", "calc("', self.source)
+        self.assertIn('setImp(pair[0], "max-width", "calc("', self.source)
+        self.assertNotIn(
+            'setImp(pair[0], "flex", "0 0 " + pair[1] + "px")',
+            self.source,
+        )
         self.assertIn('handle.setAttribute("aria-valuenow"', self.source)
+
+    def test_viewport_resize_keeps_root_surfaces_dark(self):
+        """窗口快速缩放时，顶层布局重排不能露出浏览器默认白色背景。"""
+        self.assertIn("html, body, .stApp, [data-testid=\"stApp\"]", self.source)
+        self.assertIn("background-color: #0e0e0e !important;", self.source)
+
+    def test_streamlit_text_input_wrappers_do_not_flash_white_on_resize(self):
+        """Streamlit 输入控件的外层包装不能在重排时露出白底白框。"""
+        self.assertIn('[data-testid="stTextInputRootElement"] {', self.source)
+        self.assertIn('background-color: transparent !important;', self.source)
+        self.assertIn('border: none !important;', self.source)
+
+    def test_resize_keeps_streamlit_status_and_chat_surfaces_dark(self):
+        """状态进度条、组合框与头像外层不能恢复 Streamlit 默认白色主题。"""
+        self.assertIn('[data-testid="stProgress"] [role="progressbar"] > div:first-child {', self.source)
+        self.assertIn('.react-aria-ComboBox {', self.source)
+        self.assertIn('.react-aria-ComboBox > [role="group"] {', self.source)
+        self.assertIn('[data-testid="stChatMessage"] > div:first-child {', self.source)
 
     def test_resize_edge_hit_areas_stay_above_embedded_content(self):
         """地图 iframe 与聊天内容不能遮挡整条拖拽边缘。"""
@@ -184,6 +350,12 @@ class TestChatUiContract(unittest.TestCase):
         self.assertIn('iframe[src*="/globe"]', self.source)
         self.assertIn('iframe[title*="streamlit_folium"]', self.source)
         self.assertIn("const mapFrame = getPrimaryMapFrame(mapCol);", self.source)
+
+    def test_map_fly_retries_cancel_previous_command(self):
+        """连续定位时，旧命令的延迟重试不能覆盖新定位。"""
+        self.assertIn("__cstfFlyRetryTimers", self.source)
+        self.assertIn("oldTimers.forEach((timerId) => win.clearTimeout(timerId));", self.source)
+        self.assertIn("win.__cstfFlyRetryTimers.push(timerId);", self.source)
 
     def test_alerts_are_dismissible_and_do_not_reflow_workbench(self):
         """错误/警告通知浮动显示并支持关闭，避免挤压地图与 Agent。"""
@@ -246,6 +418,16 @@ class TestChatUiContract(unittest.TestCase):
         self.assertIn("load_messages(_next_thread_id)", self.source)
         self.assertIn('_conv_c1, _conv_c2 = st.columns(2)', self.source)
         self.assertNotIn("_conversation_stay_in_history", self.source)
+
+    def test_clear_last_session_creates_new_chat_and_opens_dialog(self):
+        """删除最后一条会话后，必须创建新会话并直接回到对话视图。"""
+        start = self.source.index("_next_thread_id = next_thread_id_after_delete")
+        end = self.source.index("st.rerun()", start)
+        clear_block = self.source[start:end]
+        self.assertIn("st.session_state._conversation_thread_id = (", clear_block)
+        self.assertIn("st.session_state._conversation_store.create_thread()", clear_block)
+        self.assertIn("st.session_state.messages = [_default_chat_message.copy()]", clear_block)
+        self.assertIn("st.session_state._conversation_open_dialog = True", clear_block)
 
     def test_attachment_observer_uses_parent_document_realm(self):
         self.assertIn("win.MutationObserver", self.source)

@@ -35,6 +35,21 @@ class TestAgentContextPolicy(unittest.TestCase):
         self.assertNotIn("secret123", clean)
         self.assertNotIn("user:pass", clean)
 
+    def test_sanitize_preserves_web_urls_including_path_like_segments(self):
+        urls = (
+            "https://example.org/article/123",
+            "https://example.org/data/paper.pdf",
+            "https://service.example/app/result?id=9",
+            "http://gov.example/private/document.html",
+            "ftp://archive.example/home/report.zip",
+        )
+        raw = "参考来源：" + " ".join(urls) + " local=C:\\Users\\chl\\secret.txt"
+        clean = policy.sanitize_external_text(raw)
+        for url in urls:
+            self.assertIn(url, clean)
+        self.assertNotIn("C:\\Users\\chl", clean)
+        self.assertIn("<local-path>", clean)
+
     def test_safe_error_summary_is_bounded_and_redacted(self):
         error = RuntimeError(
             "failed /Users/chl/private/model.pth token=sk-secret "

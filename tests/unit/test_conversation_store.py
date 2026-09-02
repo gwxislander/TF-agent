@@ -51,6 +51,41 @@ class TestConversationStore(unittest.TestCase):
             self.assertNotIn("sk-secret", content)
             self.assertNotIn("user:pass@", content)
 
+    def test_history_roundtrip_preserves_web_source_links(self):
+        fd, db_path = tempfile.mkstemp(
+            prefix="conversation-links-", suffix=".sqlite3", dir=os.getcwd()
+        )
+        os.close(fd)
+        try:
+            store = ConversationStore(db_path)
+            links = (
+                "https://example.org/article/123",
+                "https://example.org/data/paper.pdf",
+                "https://service.example/app/result?id=9",
+            )
+            content = "参考来源\n" + "\n".join(
+                f"[{index}] {link}" for index, link in enumerate(links, 1)
+            )
+            store.replace_messages(
+                "thread-links",
+                [{"role": "assistant", "content": content}],
+            )
+
+            restored_messages = store.load_messages("thread-links")
+            # Streamlit persists the full message snapshot again after every
+            # history switch or subsequent prompt.  Exercise that second pass
+            # because it was the trigger that used to corrupt saved links.
+            store.replace_messages("thread-links", restored_messages)
+            restored = store.load_messages("thread-links")[0]["content"]
+            for link in links:
+                self.assertIn(link, restored)
+            self.assertNotIn("<local-path>", restored)
+        finally:
+            for suffix in ("", "-wal", "-shm"):
+                candidate = db_path + suffix
+                if os.path.exists(candidate):
+                    os.remove(candidate)
+
     def test_persisted_messages_redact_bare_provider_key(self):
         with tempfile.TemporaryDirectory() as td:
             store = ConversationStore(os.path.join(td, "chat.sqlite3"))
@@ -130,6 +165,17 @@ class TestConversationStore(unittest.TestCase):
                 store.create_thread(f"thread-{index}")
             self.assertEqual(len(store.list_threads(limit=2)), 2)
             self.assertEqual(len(store.list_threads(limit=0)), 1)
+
+    def test_list_threads_can_return_all_visible_sessions_without_display_limit(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = ConversationStore(os.path.join(td, "sessions.sqlite3"), max_sessions=20)
+            for index in range(12):
+                thread_id = store.create_thread(f"thread-{index}")
+                store.append_message(thread_id, "user", f"prompt-{index}")
+
+            rows = store.list_threads(limit=None, include_empty=False)
+
+            self.assertEqual(len(rows), 12)
 
     def test_list_threads_preview_prefers_user_message_over_greeting(self):
         with tempfile.TemporaryDirectory() as td:

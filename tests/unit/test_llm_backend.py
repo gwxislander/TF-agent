@@ -43,6 +43,21 @@ class TestLLMBackend(unittest.TestCase):
         self.assertTrue({"text", "tools", "vision"}.issubset(cfg.capabilities))
         self.assertTrue(backend_status(cfg)["configured"])
 
+    def test_dashscope_qwen38_models_declare_vision_without_vl_suffix(self):
+        """DashScope 多模态模型不应依赖模型名包含 ``vl`` 才声明视觉能力。"""
+        for model in ("qwen3.8-flash", "qwen3.8-27b"):
+            with self.subTest(model=model), mock.patch.dict(
+                os.environ,
+                {
+                    "CSTF_LLM_BACKEND": "dashscope",
+                    "CSTF_LLM_API_KEY": "unit-key",
+                    "CSTF_LLM_MODEL": model,
+                },
+                clear=True,
+            ):
+                cfg = LLMBackendConfig.from_env()
+            self.assertIn("vision", cfg.capabilities)
+
     def test_local_without_tool_capability_is_rejected_for_agent(self):
         with mock.patch.dict(
             os.environ,

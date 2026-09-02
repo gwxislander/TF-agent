@@ -37,6 +37,7 @@ jobs:
           pip install --upgrade pip
           pip install torch --index-url https://download.pytorch.org/whl/cpu
           pip install numpy rasterio geopandas scipy scikit-image shapely streamlit \
+            leafmap streamlit-folium einops \
             python-dotenv chromadb langchain-openai langchain-core langgraph \
             fastapi uvicorn httpx aiohttp Pillow reportlab sentence-transformers
           pip install -r requirements-test.txt

@@ -461,7 +461,8 @@ def build_gee_download_plan(
     if len(bands) != len(set(bands)):
         blockers.append("波段列表含重复项。")
 
-    # 导出目标（drive 需文件夹名；local 需可写目录）
+    # 导出目标（drive 需文件夹名；local 只在执行前验证目录）。
+    # 计划构建应保持无副作用，并允许用户先确认一个尚未创建的目标目录。
     if str(export_to or "").strip().lower() == "drive":
         if not str(drive_folder or "").strip():
             blockers.append("Drive 导出需指定文件夹名。")
@@ -469,14 +470,7 @@ def build_gee_download_plan(
         if not str(local_out_dir or "").strip():
             blockers.append("本地导出需指定输出目录。")
         else:
-            try:
-                os.makedirs(local_out_dir, exist_ok=True)
-                probe = os.path.join(local_out_dir, ".cstf_gee_write_probe")
-                with open(probe, "w", encoding="utf-8") as f:
-                    f.write("ok")
-                os.remove(probe)
-            except OSError as e:
-                blockers.append(f"输出目录不可写: {rel_path(local_out_dir)}（{safe_error_summary(e)}）")
+            local_out_dir = str(local_out_dir).strip()
 
     # 日期合法性
     try:

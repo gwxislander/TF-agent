@@ -169,6 +169,46 @@ def _save_chat_image_preview(uploaded_file):
         return None, name
 
 
+def _dedupe_uploaded_images(uploaded_files):
+    """Remove duplicate browser uploads before creating one chat message.
+
+    A synthetic uploader ``change`` event can make Streamlit receive the same
+    browser file twice with different server-side ``file_id`` values.  Use the
+    id when available, and fall back to a content fingerprint so a repeated
+    upload cannot produce duplicate previews or model inputs.
+    """
+    unique = []
+    seen_ids = set()
+    seen_fingerprints = set()
+    for uploaded_file in list(uploaded_files or []):
+        file_id = str(getattr(uploaded_file, "file_id", "") or "")
+        if file_id and file_id in seen_ids:
+            continue
+        name = os.path.basename(str(getattr(uploaded_file, "name", "") or ""))
+        file_type = str(getattr(uploaded_file, "type", "") or "")
+        try:
+            raw = bytes(uploaded_file.getbuffer())
+            fingerprint = (
+                name,
+                file_type,
+                len(raw),
+                hashlib.sha256(raw).hexdigest(),
+            )
+        except Exception:
+            fingerprint = (
+                name,
+                file_type,
+                int(getattr(uploaded_file, "size", 0) or 0),
+            )
+        if fingerprint in seen_fingerprints:
+            continue
+        if file_id:
+            seen_ids.add(file_id)
+        seen_fingerprints.add(fingerprint)
+        unique.append(uploaded_file)
+    return unique
+
+
 def _render_chat_attachment_previews(message):
     """Render every live local preview attached to one chat message."""
     preview_paths = message.get("image_preview_paths") or []
@@ -224,19 +264,27 @@ _RE_CMD_PIPELINE = re.compile(
     re.IGNORECASE,
 )
 # 模型常只写自然语言坐标而未附 SYSTEM_COMMAND / COMMAND_UPDATE_MAP
+_RE_MAP_COORDS_CHINESE = re.compile(
+    r"(?:北纬|纬度)\s*([+-]?\d+(?:\.\d+)?)\s*[°º度]?\s*[,，、;/\s]+\s*"
+    r"(?:东经|经度)\s*([+-]?\d+(?:\.\d+)?)\s*[°º度]?",
+)
 _RE_MAP_COORDS_NSEW = re.compile(
     r"([-\d.]+)\s*[°º]?\s*[Nn北]\s*[,，/]\s*([-\d.]+)\s*[°º]?\s*[Ee东]",
 )
 _RE_MAP_COORDS_PLAIN = re.compile(
-    r"(?:中心点|中心|坐标|定位(?:至|到)?|跳转(?:至|到)?|视角)\s*"
-    r"[（(]?\s*([-\d.]+)\s*[,，]\s*([-\d.]+)\s*[)）]?",
+    r"(?:中心点|中心坐标|中心|经纬度|坐标|定位(?:至|到)?|跳转(?:至|到)?|视角)\s*"
+    r"(?:约|为)?\s*[：:=]?\s*[（(]?\s*([-\d.]+)\s*[,，]\s*([-\d.]+)\s*[)）]?",
 )
 _RE_MAP_ZOOM = re.compile(
     r"(?:缩放(?:级别|等级)?|zoom)\s*(?:为|到|=|：|:)?\s*(\d{1,2})",
     re.IGNORECASE,
 )
 _RE_MAP_INTENT = re.compile(
-    r"(已定位|已跳转|已将地图|地图视角|视角已|飞到|定位到|跳转到|挪到|中心点)",
+    r"(已定位|已跳转|已将地图|已为您定位|地图视角|视角已|飞到|定位到|定位至|跳转到|挪到|中心点)",
+)
+_RE_MAP_LABEL = re.compile(
+    r"(?:已将地图(?:视角)?定位到|已成功定位到|已为您定位至|已定位到|已定位|定位到|定位至)\s*"
+    r"([^\s（(，,。；;：:\n]{1,30}?)(?:区域)?(?=[（(，,。；;：:\s]|$)"
 )
 
 
@@ -266,7 +314,17 @@ def _parse_agent_map_command(reply: str):
         return None
     lat = lon = None
     span = ""
-    m = _RE_MAP_COORDS_NSEW.search(flat)
+    m = _RE_MAP_COORDS_CHINESE.search(flat)
+    if m:
+        try:
+            lat, lon = float(m.group(1)), float(m.group(2))
+            span = m.group(0)
+        except (ValueError, TypeError):
+            lat = lon = None
+    if lat is None:
+        m = _RE_MAP_COORDS_NSEW.search(flat)
+    else:
+        m = None
     if m:
         try:
             lat, lon = float(m.group(1)), float(m.group(2))
@@ -293,6 +351,13 @@ def _parse_agent_map_command(reply: str):
         except (ValueError, TypeError):
             zoom = 9
     return lat, lon, zoom, span or f"{lat},{lon},{zoom}"
+
+
+def _parse_agent_map_label(reply: str) -> str:
+    """Extract the place name from a model's explicit map-location claim."""
+    flat = re.sub(r"[`*_\n\r]+", " " , reply or "")
+    match = _RE_MAP_LABEL.search(flat)
+    return match.group(1).strip() if match else ""
 
 
 def _strip_map_command_from_reply(reply: str) -> str:
@@ -522,7 +587,7 @@ def scan_and_register_existing(final_root):
             if f.endswith("_Index_Final.tif"):
                 task_name = f.replace("_Index_Final.tif", "")
                 key = f"{task_name}_index"
-                if key not in registry:
+                if key not in registry or not os.path.exists(str(registry.get(key, {}).get("file_path") or "")):
                     registry[key] = {
                         "task": task_name,
                         "method": "index",
@@ -548,7 +613,7 @@ def scan_and_register_existing(final_root):
                 prob = float(param_str.split("_c")[0].replace("p", ""))
                 cnt = int(param_str.split("_c")[1])
                 key = f"{task_name}_p{prob:.2f}_c{cnt}"
-                if key not in registry:
+                if key not in registry or not os.path.exists(str(registry.get(key, {}).get("file_path") or "")):
                     registry[key] = {
                         "task": task_name,
                         "prob_threshold": prob,
@@ -2259,11 +2324,51 @@ if _agent_flush.applied and _agent_flush.action_type == "run_gee_download":
 # =======================================================
 st.markdown("""
 <style>
-    [data-testid="stAppViewContainer"] { background-color: #0e0e0e; }
+    /* Keep the browser and Streamlit root surfaces dark during viewport
+       reflow.  Without this, rapid window resizing exposes the default white
+       body/.stApp background between the fixed workbench layers. */
+    html, body, .stApp, [data-testid="stApp"] {
+        background-color: #0e0e0e !important;
+    }
+    [data-testid="stAppViewContainer"] { background-color: #0e0e0e !important; }
     [data-testid="stHeader"] { background-color: rgba(14, 14, 14, 0); } 
     h1, h2, h3, p, span, div { color: #cccccc !important; }
     [data-testid="stSidebar"] { background-color: #1b1b1d !important; border-right: 1px solid #333333; }
     [data-testid="stSidebar"] * { color: #cccccc !important; }
+    /* Streamlit 1.62 adds a white background/border to this wrapper around
+       every text input.  During a viewport reflow it becomes a visible white
+       flash around the dark field, so keep the wrapper itself transparent. */
+    [data-testid="stTextInputRootElement"] {
+        background-color: transparent !important;
+        border: none !important;
+    }
+    /* Keep the status rail dark across Streamlit rerenders. */
+    [data-testid="stProgress"] [role="progressbar"] > div:first-child {
+        background-color: #2a2d3b !important;
+        border-radius: 999px !important;
+    }
+    [data-testid="stProgress"] [role="progressbar"] > div:first-child > div {
+        background-color: #3a62d7 !important;
+        border-radius: 999px !important;
+    }
+    .react-aria-ComboBox {
+        background-color: transparent !important;
+        border: none !important;
+    }
+    .react-aria-ComboBox > [role="group"] {
+        background-color: transparent !important;
+        border: none !important;
+    }
+    [data-testid="stChatMessageAvatar"] {
+        background-color: #0d131d !important;
+        border: 1px solid #2c3649 !important;
+    }
+    /* Streamlit 1.62 renders the avatar as the first child without a stable
+       data-testid; keep that actual container dark as well. */
+    [data-testid="stChatMessage"] > div:first-child {
+        background-color: #0d131d !important;
+        border: 1px solid #2c3649 !important;
+    }
     .stTextInput>div>div>input, .stSelectbox>div>div>div { background-color: #252526 !important; color: #eeeeee !important; border: 1px solid #3d3d3d !important; border-radius: 2px !important; }
     .stTextInput>div>div>input:focus, .stSelectbox>div>div>div:focus { border-color: #3A62D7 !important; box-shadow: none !important; }
     div.stButton > button { border-radius: 2px !important; font-weight: 600 !important; letter-spacing: 1px; padding: 0.5rem 1rem !important; }
@@ -2367,12 +2472,17 @@ st.markdown("""
         max-height: var(--workbench-h) !important;
         overflow: hidden !important;
         align-items: stretch !important;
+        /* Keep map and Agent side-by-side after a drag or viewport resize.
+           Streamlit otherwise wraps the second column below the fixed-height
+           workbench, making the Agent UI appear to disappear. */
+        flex-wrap: nowrap !important;
     }
     div[data-testid="stHorizontalBlock"]:has(.cockpit-map-col) > div[data-testid="stColumn"] {
         height: var(--workbench-h) !important;
         max-height: var(--workbench-h) !important;
         overflow: hidden !important;
         align-self: stretch !important;
+        min-width: 0 !important;
     }
     div[data-testid="stColumn"]:has(.cockpit-map-col) > div[data-testid="stVerticalBlock"] {
         height: 100% !important;
@@ -2963,6 +3073,15 @@ st.markdown("""
         background: linear-gradient(180deg, #151b28 0%, #121720 100%) !important;
         margin-top: 4px !important;
     }
+    /* 预览条是输入框的一部分：显示时为输入行预留缩略图高度，避免
+       预览脱离外框漂浮到消息区。 */
+    div[data-testid="stForm"].cstf-chat-compose:has(.cstf-attach-preview.is-visible) {
+        padding-top: 5.8rem !important;
+    }
+    /* 预览条需要以聊天表单为定位上下文，而不是以只有加号宽度的入口为定位上下文。 */
+    div[data-testid="stForm"].cstf-chat-compose .cstf-attach-bar {
+        position: static !important;
+    }
     div[data-testid="stForm"].cstf-chat-compose .cstf-chat-input-row {
         display: flex !important;
         flex-direction: row !important;
@@ -3025,12 +3144,6 @@ st.markdown("""
     div[data-testid="stForm"].cstf-chat-compose [data-testid="stFileUploader"] small {
         display: none !important;
     }
-    /* The actual consent value is submitted with the Streamlit form, while
-       the + menu below provides the visible one-shot choice without adding a
-       fourth item or a second row to the composer. */
-    div[data-testid="stForm"].cstf-chat-compose div[data-testid="stElementContainer"]:has(
-        [data-testid="stCheckbox"] input[aria-label*="附件外发授权"]
-    ),
     div[data-testid="stForm"].cstf-chat-compose div[data-testid="stElementContainer"]:has(
         .cstf-attachment-epoch-marker
     ) {
@@ -3041,7 +3154,87 @@ st.markdown("""
         padding: 0 !important;
     }
     div[data-testid="stForm"].cstf-chat-compose .cstf-attach-bar {
+        position: static !important;
+    }
+    /* 选择附件后在聊天输入外框内显示缩略图/格式卡片，不改变消息行宽度。 */
+    div[data-testid="stForm"].cstf-chat-compose .cstf-attach-preview {
+        position: absolute !important;
+        top: 8px !important;
+        right: 10px !important;
+        bottom: auto !important;
+        left: 10px !important;
+        display: none !important;
+        align-items: center !important;
+        flex-direction: row !important;
+        flex-wrap: nowrap !important;
+        gap: 6px !important;
+        width: auto !important;
+        min-width: 0 !important;
+        max-width: none !important;
+        max-height: 5.5rem !important;
+        padding: 5px !important;
+        overflow-x: auto !important;
+        overflow-y: hidden !important;
+        border: 1px solid #41506c !important;
+        border-radius: 10px !important;
+        background: #111827 !important;
+        box-shadow: 0 10px 24px rgba(0, 0, 0, 0.42) !important;
+        z-index: 1550 !important;
+    }
+    div[data-testid="stForm"].cstf-chat-compose .cstf-attach-preview.is-visible {
+        display: flex !important;
+    }
+    div[data-testid="stForm"].cstf-chat-compose .cstf-attach-preview-card {
         position: relative !important;
+        display: inline-flex !important;
+        flex: 0 0 4.5rem !important;
+        width: 4.5rem !important;
+        height: 4.5rem !important;
+        align-items: center !important;
+        justify-content: center !important;
+        overflow: hidden !important;
+        border: 1px solid #41506c !important;
+        border-radius: 8px !important;
+        background: #0d131d !important;
+        color: #c9d5ea !important;
+        font-size: 0.62rem !important;
+        text-align: center !important;
+    }
+    div[data-testid="stForm"].cstf-chat-compose .cstf-attach-preview-card img {
+        width: 100% !important;
+        height: 100% !important;
+        object-fit: cover !important;
+    }
+    div[data-testid="stForm"].cstf-chat-compose .cstf-attach-preview-label {
+        max-width: 100% !important;
+        padding: 4px !important;
+        overflow: hidden !important;
+        color: #c9d5ea !important;
+        font-size: 0.62rem !important;
+        line-height: 1.25 !important;
+        text-overflow: ellipsis !important;
+        white-space: nowrap !important;
+    }
+    div[data-testid="stForm"].cstf-chat-compose .cstf-attach-preview-clear {
+        align-self: flex-start !important;
+        flex: 0 0 1.35rem !important;
+        width: 1.35rem !important;
+        height: 1.35rem !important;
+        margin: -2px -2px 0 0 !important;
+        padding: 0 !important;
+        border: 1px solid #41506c !important;
+        border-radius: 50% !important;
+        background: #0d131d !important;
+        color: #edf2ff !important;
+        font-size: 0.9rem !important;
+        line-height: 1 !important;
+        cursor: pointer !important;
+    }
+    div[data-testid="stForm"].cstf-chat-compose .cstf-attach-preview-clear:hover,
+    div[data-testid="stForm"].cstf-chat-compose .cstf-attach-preview-clear:focus-visible {
+        border-color: #6f8fd7 !important;
+        background: #1e2838 !important;
+        outline: none !important;
     }
     div[data-testid="stForm"].cstf-chat-compose .cstf-plus-btn {
         position: relative !important;
@@ -3077,54 +3270,6 @@ st.markdown("""
         opacity: 1;
         transform: translate(0, 0);
     }
-    div[data-testid="stForm"].cstf-chat-compose .cstf-attach-bar.is-open .cstf-plus-btn::after {
-        display: none !important;
-    }
-    div[data-testid="stForm"].cstf-chat-compose .cstf-attach-choice {
-        display: none;
-        position: absolute;
-        left: 0;
-        bottom: calc(100% + 9px);
-        z-index: 1600;
-        width: min(18rem, 72vw);
-        padding: 10px;
-        border: 1px solid #41506c;
-        border-radius: 12px;
-        background: #111827;
-        box-shadow: 0 12px 30px rgba(0, 0, 0, 0.42);
-        color: #e6edf8;
-        text-align: left;
-    }
-    div[data-testid="stForm"].cstf-chat-compose .cstf-attach-bar.is-open .cstf-attach-choice {
-        display: block;
-    }
-    div[data-testid="stForm"].cstf-chat-compose .cstf-attach-choice-title {
-        margin: 0 0 8px;
-        color: #aebbd0;
-        font-size: 0.76rem;
-        line-height: 1.45;
-    }
-    div[data-testid="stForm"].cstf-chat-compose .cstf-attach-choice-actions {
-        display: grid;
-        grid-template-columns: 1fr 1fr;
-        gap: 7px;
-    }
-    div[data-testid="stForm"].cstf-chat-compose .cstf-attach-choice button {
-        min-height: 2rem;
-        padding: 5px 8px;
-        border: 1px solid #41506c;
-        border-radius: 8px;
-        background: #182131;
-        color: #e6edf8;
-        font-size: 0.74rem;
-        cursor: pointer;
-    }
-    div[data-testid="stForm"].cstf-chat-compose .cstf-attach-choice button:hover,
-    div[data-testid="stForm"].cstf-chat-compose .cstf-attach-choice button:focus-visible {
-        border-color: #6f8fd7;
-        background: #23314a;
-        outline: none;
-    }
     .deck-section-title {
         font-size: 0.95rem !important;
         font-weight: 600 !important;
@@ -3146,6 +3291,45 @@ st.markdown("""
         max-height: 250px !important;
         overflow-y: auto !important;
         overflow-x: hidden !important;
+    }
+    /* 历史会话数量不截断；只让带标记的历史列表容器在自身范围内滚动。 */
+    div[data-testid="stColumn"]:has(.cstf-agent-view-history) > div[data-testid="stVerticalBlock"] > [data-testid="stElementContainer"]:has(.cstf-history-list-marker) {
+        flex: 1 1 auto !important;
+        min-height: 0 !important;
+        overflow: hidden !important;
+        display: flex !important;
+        flex-direction: column !important;
+    }
+    div[data-testid="stColumn"]:has(.cstf-agent-view-history) [data-testid="stVerticalBlockBorderWrapper"]:has(.cstf-history-list-marker) {
+        flex: 1 1 auto !important;
+        min-height: 0 !important;
+        height: 100% !important;
+        max-height: 100% !important;
+        overflow-y: auto !important;
+        overflow-x: hidden !important;
+    }
+    div[data-testid="stColumn"]:has(.cstf-agent-view-history) [data-testid="stLayoutWrapper"]:has(.cstf-history-list-marker) {
+        flex: 1 1 0 !important;
+        min-height: 0 !important;
+        height: 100% !important;
+        max-height: 100% !important;
+        overflow-y: auto !important;
+        overflow-x: hidden !important;
+        /* Keep the frame on the fixed scroll viewport; the inner block moves
+           with scrollTop and must not carry the visible border. */
+        border: 1px solid rgba(250, 250, 250, 0.2) !important;
+        border-radius: 8px !important;
+        box-sizing: border-box !important;
+        background: #0d131d !important;
+    }
+    div[data-testid="stColumn"]:has(.cstf-agent-view-history) [data-testid="stLayoutWrapper"]:has(.cstf-history-list-marker) > [data-testid="stVerticalBlock"] {
+        border: 0 !important;
+        border-radius: 0 !important;
+        background: transparent !important;
+        box-shadow: none !important;
+    }
+    div[data-testid="stColumn"]:has(.cstf-agent-view-history) [data-testid="stLayoutWrapper"]:has(.cstf-history-list-marker) > [data-testid="stVerticalBlock"] {
+        min-height: 0 !important;
     }
     div[data-testid="stColumn"]:has(.cstf-agent-view-history) [data-testid="stForm"] input[aria-label="chat_input"] {
         min-height: 2.4rem !important;
@@ -4650,14 +4834,18 @@ with col_map:
                             st.warning("地图跳转参数无效：" + "; ".join(_fly_errs or []))
                         else:
                             # READY 握手：等 Cesium 就绪后发；等待窗口超 3s 仍未就绪则带警告发送
-                            _mp_state = _globe_srv.map_protocol_state()
+                            _map_ready_warning = False
+                            _map_channel_id = st.session_state.get("_map_channel_id")
+                            _mp_state = _globe_srv.map_protocol_state(
+                                channel_id=_map_channel_id
+                            )
                             _ready_ok = bool(_mp_state.get("ready_ts"))
                             if not _ready_ok:
                                 _wait_started = st.session_state.get("_map_ready_wait_started")
                                 if _wait_started is None:
                                     st.session_state._map_ready_wait_started = time.time()
                                 elif (time.time() - float(_wait_started)) > 3.0:
-                                    st.caption("⚠️ 地图尚未确认就绪（可能仍在加载），已尝试跳转。")
+                                    _map_ready_warning = True
                             import json as _json
 
                             _fly_js = _json.dumps(_fly_payload, ensure_ascii=False)
@@ -4694,25 +4882,47 @@ with col_map:
     }});
     return sent;
   }};
-  if (!send()) {{
-    let n = 0;
-    const t = setInterval(() => {{
-      if (send() || ++n > 40) clearInterval(t);
-    }}, 120);
-  }}
+  // 每次定位都会注入一个很短的隐藏组件。若上一轮定位的延迟重试
+  // 仍在 parent window 中排队，它们可能在本轮定位之后再次把相机拉回旧位置。
+  // 将定时器挂在 parent 上并在新命令开始时统一取消，保证“最后一次定位”胜出。
+  try {{
+    const oldTimers = Array.isArray(win.__cstfFlyRetryTimers)
+      ? win.__cstfFlyRetryTimers : [];
+    oldTimers.forEach((timerId) => win.clearTimeout(timerId));
+    win.__cstfFlyRetryTimers = [];
+  }} catch (e) {{}}
+  // The iframe element can exist before Cesium installs its message listener.
+  // Retry at a few increasing delays; avoid restarting the camera flight
+  // continuously while the viewer is animating.
+  const retryDelays = [150, 400, 900, 1800, 3200, 5000];
+  send();
+  retryDelays.forEach((delay) => {{
+    try {{
+      const timerId = win.setTimeout(send, delay);
+      win.__cstfFlyRetryTimers.push(timerId);
+    }} catch (e) {{
+      setTimeout(send, delay);
+    }}
+  }});
 }})();
 </script>
                             """,
                                 height=0,
                             )
                             # 短等待 FLY_ACK（最多 ~1.2s），成功则 toast；未确认不阻塞
-                            _ack = _globe_srv.wait_map_ack(_fly_payload.get("command_id", ""), timeout=1.2)
+                            _ack = _globe_srv.wait_map_ack(
+                                _fly_payload.get("command_id", ""),
+                                timeout=1.2,
+                                channel_id=_map_channel_id,
+                            )
                             if _ack:
                                 st.session_state["_map_ready_wait_started"] = None
                                 if _ack.get("ok"):
                                     st.toast(f"地图已定位：{_fly_label}", icon="🗺️")
                                 else:
                                     st.warning("地图跳转未完成，请检查地球页面状态。")
+                            if _ack is None and _map_ready_warning:
+                                st.caption("⚠️ 地图尚未确认就绪（可能仍在加载），已尝试跳转。")
                     except (TypeError, ValueError):
                         pass
             else:
@@ -4876,10 +5086,6 @@ with col_side:
         "role": "assistant",
         "content": "您好！我是智能分析助手。请告诉我您想分析的区域和年份，或上传截图让我识别。",
     }
-    # Attachment consent is one-shot and only appears after a file is chosen;
-    # it never occupies the compact compose row or silently persists across
-    # reruns/conversations.
-    st.session_state.setdefault("agent_external_media_consent", False)
     st.session_state.setdefault("agent_spatial_consent", False)
     # Session buttons are rendered below the radio widget. Defer the widget
     # value change to the next rerun so Streamlit does not reject a post-
@@ -4901,7 +5107,7 @@ with col_side:
     if _agent_dock_view == "历史" and st.session_state.get("_conversation_store") is not None:
         try:
             _conversation_threads = st.session_state._conversation_store.list_threads(
-                limit=8,
+                limit=None,
                 include_empty=False,
             )
         except Exception:
@@ -4909,6 +5115,7 @@ with col_side:
         st.markdown('<div class="cstf-session-list-heading">会话列表</div>', unsafe_allow_html=True)
         # 历史列表填充 Agent Dock 的剩余高度，内容过多时仅在列表内部滚动。
         with st.container(height="stretch", border=True):
+            st.markdown('<div class="cstf-history-list-marker" aria-hidden="true"></div>', unsafe_allow_html=True)
             if not _conversation_threads:
                 st.caption("暂无历史会话")
             else:
@@ -4951,7 +5158,7 @@ with col_side:
             if st.button(
                 "清空会话",
                 key="conversation_clear",
-                help="删除当前会话，并在历史列表中选中下一条会话",
+                help="删除当前会话；有下一条则选中，否则创建新会话并进入对话",
                 use_container_width=True,
                 disabled=not bool(st.session_state.get("_conversation_thread_id")),
             ):
@@ -4972,8 +5179,15 @@ with col_side:
                         or [_default_chat_message.copy()]
                     )
                 else:
-                    st.session_state._conversation_thread_id = None
-                    st.session_state.messages = []
+                    # Do not leave the dock with an empty chat container after
+                    # the final session is removed.  Create a fresh draft and
+                    # use the existing deferred flag to switch back to chat
+                    # view on the next Streamlit rerun.
+                    st.session_state._conversation_thread_id = (
+                        st.session_state._conversation_store.create_thread()
+                    )
+                    st.session_state.messages = [_default_chat_message.copy()]
+                    st.session_state._conversation_open_dialog = True
                 st.rerun()
     st.markdown('<div class="cockpit-chat-anchor"></div>', unsafe_allow_html=True)
     # 历史页不需要聊天容器边框；避免无会话时在底部留下空白行。
@@ -4992,9 +5206,6 @@ with col_side:
                     st.markdown('<div class="msg-role msg-role-assistant">智能体</div>', unsafe_allow_html=True)
                 st.markdown(msg["content"])
                 _render_chat_attachment_previews(msg)
-
-    if st.session_state.pop("_attachment_consent_reset_pending", False):
-        st.session_state["agent_external_media_consent"] = False
 
     st.markdown('<div class="cstf-chat-compose-host">', unsafe_allow_html=True)
     with st.form(key="chat_form", clear_on_submit=True):
@@ -5022,15 +5233,6 @@ with col_side:
             key=f"chat_attach_uploader_{_attachment_uploader_epoch}",
         )
         uploaded_images = list(uploaded_images or [])
-        # The real checkbox stays inside the form so the compact attachment
-        # menu can set a one-shot choice before the same form is submitted.
-        # CSS hides the native row; the + button exposes the accessible choice
-        # between local-only preview and external model analysis.
-        st.checkbox(
-            "附件外发授权（仅本轮）",
-            key="agent_external_media_consent",
-            help="允许后，本轮附件的受限 PNG 预览才会发送给已配置模型。",
-        )
         st.markdown(
             f'<span class="cstf-attachment-epoch-marker" data-epoch="{_attachment_uploader_epoch}" '
             'aria-hidden="true"></span>',
@@ -5072,9 +5274,6 @@ with col_side:
             chatForm.classList.add('cstf-chat-compose');
             const fileWrap = chatForm.querySelector('[data-testid="stFileUploader"]');
             const fileInput = chatForm.querySelector('input[type="file"]');
-            const consentInput = chatForm.querySelector(
-              'input[type="checkbox"][aria-label*="附件外发授权"]'
-            );
             const epochMarker = chatForm.querySelector('.cstf-attachment-epoch-marker');
             const uploaderEpoch = epochMarker?.dataset?.epoch || 'unknown';
             if (!fileWrap || !fileInput) return false;
@@ -5097,7 +5296,6 @@ with col_side:
               } catch (_) {
                 /* The server-side uploader key remains the final fallback. */
               }
-              delete win.__cstfAttachmentPendingEpoch;
             }
             win.__cstfAttachmentLastEpoch = uploaderEpoch;
 
@@ -5114,8 +5312,8 @@ with col_side:
             inputColumn?.classList.add('cstf-chat-input-column');
             sendColumn?.classList.add('cstf-chat-send-column');
 
-            if (
-              existingController?.version === '2026-08-23-attachment-v3'
+            const canReuseController = Boolean(
+              existingController?.version === '2026-08-23-attachment-v7'
               && existingController?.fileInput === fileInput
               && existingController?.fileInput?.isConnected
               && existingController?.sendButton === sendButton
@@ -5123,7 +5321,8 @@ with col_side:
               && existingController?.uploaderEpoch === uploaderEpoch
               && existingController?.bar?.isConnected
               && typeof existingController.sync === 'function'
-            ) {
+            );
+            if (canReuseController) {
               existingController.sync();
               return true;
             }
@@ -5139,35 +5338,155 @@ with col_side:
             bar.innerHTML =
                 '<button type="button" class="cstf-plus-btn" ' +
                 'data-tooltip="每个文件≤200MB · PNG / JPG / WebP / TIFF" ' +
-                'aria-haspopup="dialog" aria-expanded="false" ' +
-                'aria-label="选择附件上传方式（每个文件≤200MB；PNG、JPG、WebP、TIFF）">+</button>' +
-                '<div class="cstf-attach-choice" role="dialog" aria-label="附件上传方式" aria-hidden="true">' +
-                  '<p class="cstf-attach-choice-title">选择本轮附件用途。仅“发送给模型”会把受限预览交给已配置模型。</p>' +
-                  '<div class="cstf-attach-choice-actions">' +
-                    '<button type="button" data-media-mode="local">仅本地预览</button>' +
-                    '<button type="button" data-media-mode="external">发送给模型</button>' +
-                  '</div>' +
-                '</div>';
+                'aria-label="选择附件（每个文件≤200MB；PNG、JPG、WebP、TIFF）">+</button>' +
+                '<div class="cstf-attach-preview" role="list" aria-label="已选择附件预览"></div>';
             // 将附件入口放到消息输入行最左侧；文件选择器本身仍隐藏在表单内。
             if (bar.parentElement !== inputRow) inputRow.insertBefore(bar, inputRow.firstChild);
 
             const plusBtn = bar.querySelector('.cstf-plus-btn');
-            const choicePanel = bar.querySelector('.cstf-attach-choice');
-            const modeButtons = bar.querySelectorAll('[data-media-mode]');
+            const previewPanel = bar.querySelector('.cstf-attach-preview');
 
             const defaultTooltip = '每个文件≤200MB · PNG / JPG / WebP / TIFF';
+            const previewUrls = new Set();
+            // 浏览器每次重新打开文件选择器都会替换原生 FileList；在本轮
+            // 会话内显式累积 File 对象，再同步回 input，避免只剩最后一次选择。
+            let selectedFiles = Array.from(fileInput.files || []).slice(0, 6);
+            let selectedFilesSyncing = false;
+            let renderedPreviewSignature = null;
             let active = true;
 
-            const setChoiceOpen = (open) => {
-              bar.classList.toggle('is-open', Boolean(open));
-              plusBtn?.setAttribute('aria-expanded', open ? 'true' : 'false');
-              choicePanel?.setAttribute('aria-hidden', open ? 'false' : 'true');
+            const fileIdentity = (file) => [
+              String(file?.name || ''),
+              String(file?.size || 0),
+              // Streamlit/browser bridges can reconstruct File objects with a
+              // fresh lastModified timestamp on every reconciliation. Use
+              // stable display and MIME fields so one selected attachment
+              // remains one preview instead of visibly blinking.
+              String(file?.type || ''),
+            ].join('::');
+
+            const assignSelectedFiles = (files, notify = false) => {
+              try {
+                const transfer = new win.DataTransfer();
+                files.slice(0, 6).forEach((file) => transfer.items.add(file));
+                fileInput.files = transfer.files;
+                if (notify) {
+                  // Streamlit 的上传器通过 change 事件同步内部 widget 状态；
+                  // 赋值 FileList 本身不会触发该事件，因此补发一次聚合后的变更。
+                  selectedFilesSyncing = true;
+                  fileInput.dispatchEvent(new win.Event('change', { bubbles: true }));
+                }
+                return true;
+              } catch (_) {
+                // 现代 Chromium 支持 DataTransfer；若浏览器禁用赋值，
+                // 仍保留本地预览，服务端会按原生 FileList 能力处理。
+                return false;
+              }
             };
 
-            const setMediaConsent = (allowExternal) => {
-              if (consentInput && consentInput.checked !== allowExternal) {
-                consentInput.click();
+            const mergeSelectedFiles = (files) => {
+              const priorSelectionCount = selectedFiles.length;
+              const merged = [...selectedFiles];
+              const seen = new Set(merged.map(fileIdentity));
+              files.forEach((file) => {
+                const identity = fileIdentity(file);
+                if (!seen.has(identity)) {
+                  seen.add(identity);
+                  merged.push(file);
+                }
+              });
+              selectedFiles = merged.slice(0, 6);
+              // The browser's first native change already contains the full
+              // selection.  Only notify Streamlit when a later chooser round
+              // actually adds a new file; dispatching again on the first
+              // selection makes one upload appear twice in the chat message.
+              const shouldNotify = priorSelectionCount > 0
+                && selectedFiles.length > priorSelectionCount;
+              assignSelectedFiles(selectedFiles, shouldNotify);
+              return selectedFiles;
+            };
+
+            const clearAttachmentPreview = (preserveSignature = false) => {
+              previewUrls.forEach((url) => {
+                try { win.URL.revokeObjectURL(url); } catch (_) {}
+              });
+              previewUrls.clear();
+              if (!preserveSignature) renderedPreviewSignature = null;
+              if (previewPanel) {
+                previewPanel.replaceChildren();
+                previewPanel.classList.remove('is-visible');
               }
+            };
+
+            const fileExtension = (file) => {
+              const match = String(file?.name || '').match(/[.]([a-z0-9]+)$/i);
+              return match ? match[1].toUpperCase() : '文件';
+            };
+
+            const browserPreviewable = (file) => {
+              const type = String(file?.type || '').toLowerCase();
+              const name = String(file?.name || '').toLowerCase();
+              return type === 'image/png'
+                || type === 'image/jpeg'
+                || type === 'image/webp'
+                || /[.](png|jpe?g|webp)$/i.test(name);
+            };
+
+            const isGeoTiff = (file) => {
+              const type = String(file?.type || '').toLowerCase();
+              const name = String(file?.name || '').toLowerCase();
+              return type === 'image/tiff' || /[.]tiff?$/i.test(name);
+            };
+
+            const renderAttachmentPreview = (files) => {
+              if (!previewPanel) return;
+              const previewSignature = files
+                .slice(0, 6)
+                .map(fileIdentity)
+                .join('|');
+              // The attachment bridge reconciles the Streamlit DOM every
+              // 260ms. Recreating Blob URLs for an unchanged selection makes
+              // image thumbnails visibly blink, so only redraw a real change.
+              if (previewSignature === renderedPreviewSignature) return;
+              clearAttachmentPreview(true);
+              renderedPreviewSignature = previewSignature;
+              if (!files.length) return;
+              files.slice(0, 6).forEach((file) => {
+                const card = doc.createElement('div');
+                card.className = 'cstf-attach-preview-card';
+                card.setAttribute('role', 'listitem');
+                card.title = file.name;
+                if (browserPreviewable(file)) {
+                  const url = win.URL.createObjectURL(file);
+                  previewUrls.add(url);
+                  const image = doc.createElement('img');
+                  image.src = url;
+                  image.alt = file.name;
+                  card.appendChild(image);
+                } else {
+                  const label = doc.createElement('span');
+                  label.className = 'cstf-attach-preview-label';
+                  label.textContent = `${isGeoTiff(file) ? 'TIFF' : fileExtension(file)} · ${file.name}`;
+                  card.appendChild(label);
+                }
+                previewPanel.appendChild(card);
+              });
+              const clearButton = doc.createElement('button');
+              clearButton.type = 'button';
+              clearButton.className = 'cstf-attach-preview-clear';
+              clearButton.setAttribute('aria-label', '清除已选附件');
+              clearButton.textContent = '×';
+              clearButton.addEventListener('click', (event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                win.__cstfAttachmentClearRequested = true;
+                selectedFiles = [];
+                try { fileInput.value = ''; } catch (_) {}
+                clearAttachmentPreview();
+                syncAttach([]);
+              });
+              previewPanel.appendChild(clearButton);
+              previewPanel.classList.add('is-visible');
             };
 
             if (plusBtn && plusBtn.dataset.bound !== '1') {
@@ -5175,71 +5494,64 @@ with col_side:
               plusBtn.addEventListener('click', (e) => {
                 e.preventDefault();
                 e.stopPropagation();
-                if (!consentInput) {
-                  fileInput.click();
-                  return;
-                }
-                setChoiceOpen(!bar.classList.contains('is-open'));
+                // Match the original main.py flow: + opens the native chooser
+                // directly, and the selected files are sent to the active
+                // multimodal executor on submit.
+                fileInput.click();
               });
             }
 
-            modeButtons.forEach((button) => {
-              if (button.dataset.bound === '1') return;
-              button.dataset.bound = '1';
-              button.addEventListener('click', (e) => {
-                e.preventDefault();
-                e.stopPropagation();
-                setMediaConsent(button.dataset.mediaMode === 'external');
-                setChoiceOpen(false);
-                fileInput.click();
-              });
-            });
-
-            const syncAttach = () => {
+            const syncAttach = (filesOverride = undefined) => {
               if (!active) return;
-              // A submit can remount the same-epoch Streamlit widget while the
-              // model is still running. Keep that transient remount clear;
-              // the final server rerun advances the epoch and releases this
-              // guard for the next user selection.
-              if (win.__cstfAttachmentPendingEpoch === uploaderEpoch) {
-                try {
-                  fileInput.value = '';
-                } catch (_) {
-                  /* The server-side epoch remains the final fallback. */
-                }
-              } else if (
-                win.__cstfAttachmentPendingEpoch != null
-                && win.__cstfAttachmentPendingEpoch !== uploaderEpoch
-              ) {
-                delete win.__cstfAttachmentPendingEpoch;
+              // A submitted attachment must stay hidden across every
+              // Streamlit rerender and uploader-key rotation. This is
+              // intentionally not keyed by uploaderEpoch: the key changes
+              // after submit while a retained native FileList may still exist.
+              const mustRemainCleared = Boolean(
+                win.__cstfAttachmentClearRequested
+              );
+              if (mustRemainCleared) {
+                selectedFiles = [];
               }
-              const files = Array.from(fileInput.files || []);
+              const files = filesOverride === undefined
+                ? (mustRemainCleared ? [] : (selectedFiles.length ? selectedFiles : Array.from(fileInput.files || [])))
+                : Array.from(filesOverride || []);
+              selectedFiles = files.slice(0, 6);
+              renderAttachmentPreview(selectedFiles);
               plusBtn.removeAttribute('title');
-              if (files.length) {
-                const names = files.slice(0, 3).map((file) => file.name).join('、');
-                const suffix = files.length > 3 ? ` 等 ${files.length} 个附件` : '';
-                const selected = files.length === 1
-                  ? `已选择：${names} · 每个文件≤200MB`
-                  : `已选择 ${files.length} 个附件：${names}${suffix} · 每个文件≤200MB`;
-                const mode = consentInput?.checked ? '发送给模型' : '仅本地预览';
-                const described = `${selected} · ${mode}`;
-                plusBtn.dataset.tooltip = described;
-                plusBtn.setAttribute('aria-label', described);
-              } else {
-                plusBtn.dataset.tooltip = defaultTooltip;
-                plusBtn.setAttribute('aria-label', `选择附件上传方式（${defaultTooltip}）`);
-              }
+              // Tooltip is deliberately invariant; selected names belong in
+              // the preview cards, never in the format/help bubble.
+              plusBtn.dataset.tooltip = defaultTooltip;
+              plusBtn.setAttribute('aria-label', `选择附件上传方式（${defaultTooltip}）`);
             };
 
             if (fileInput.dataset.cstfBound !== bindingToken) {
               fileInput.dataset.cstfBound = bindingToken;
-              fileInput.addEventListener('change', () => {
+              fileInput.addEventListener('change', (event) => {
+                if (selectedFilesSyncing) {
+                  selectedFilesSyncing = false;
+                  syncAttach(selectedFiles);
+                  return;
+                }
                 // A genuine chooser action starts a new compose cycle even if
                 // Streamlit has not yet mounted the next server-side epoch.
-                // The submit guard is one-shot and must never clear this new
-                // user selection.
-                delete win.__cstfAttachmentPendingEpoch;
-                syncAttach();
+                // It is the only event that releases the submitted-clear
+                // guard; rerenders and stale FileLists never may do so.
+                const incomingFiles = Array.from(fileInput.files || []);
+                if (incomingFiles.length) {
+                  win.__cstfAttachmentClearRequested = false;
+                }
+                const known = new Set(selectedFiles.map(fileIdentity));
+                const addsNewFile = incomingFiles.some(
+                  (file) => !known.has(fileIdentity(file))
+                );
+                // A later chooser round is replaced by one synthetic
+                // aggregated event below. Stop the native event first, or
+                // React/Streamlit would process the same FileList twice.
+                if (selectedFiles.length > 0 && addsNewFile) {
+                  event.stopImmediatePropagation();
+                }
+                syncAttach(mergeSelectedFiles(incomingFiles));
                 setTimeout(() => {
                   const chatInput =
                     doc.querySelector(chatInputSelector);
@@ -5251,23 +5563,11 @@ with col_side:
 
             const resetAttachmentChrome = () => {
               if (!active) return;
-              setChoiceOpen(false);
               plusBtn?.removeAttribute('title');
               if (plusBtn) {
                 plusBtn.dataset.tooltip = defaultTooltip;
                 plusBtn.setAttribute('aria-label', `选择附件上传方式（${defaultTooltip}）`);
               }
-            };
-
-            const clearSelectedFileUi = () => {
-              if (!active) return;
-              try {
-                fileInput.value = '';
-              } catch (_) {
-                /* The epoch key will still clear it after the rerun. */
-              }
-              resetAttachmentChrome();
-              syncAttach();
             };
 
             const handleSendClick = (event) => {
@@ -5279,33 +5579,38 @@ with col_side:
               // replace the submit button during the same click, so a handler
               // attached only to that ephemeral button is not reliable across
               // consecutive attachment messages.
-              win.__cstfAttachmentPendingEpoch = uploaderEpoch;
+              // Hide immediately, but leave the native FileList intact until
+              // Streamlit has serialized the submitted form and the server
+              // rotates the uploader key on its post-submit rerun.
+              win.__cstfAttachmentClearRequested = true;
+              selectedFiles = [];
               resetAttachmentChrome();
-              // Delay the native picker clear so React first snapshots the
-              // attachment list for this request.
-              win.setTimeout(clearSelectedFileUi, 60);
+              renderAttachmentPreview([]);
             };
             doc.addEventListener('click', handleSendClick, true);
 
             if (chatForm.dataset.cstfAttachSubmitToken !== bindingToken) {
               chatForm.dataset.cstfAttachSubmitToken = bindingToken;
               chatForm.addEventListener('submit', () => {
-                // Streamlit has already captured the submitted form values at
-                // this point. Clear the native picker on the next browser task
-                // so the compact + control resets immediately while the model
-                // response is still running; the epoch key remains the server-
-                // side source of truth on the following rerun.
-                win.setTimeout(clearSelectedFileUi, 0);
+                // Keep the original native FileList through this browser task:
+                // Streamlit may serialize the form asynchronously. The
+                // server-side uploader epoch is the authoritative clear once
+                // the submission is accepted.
+                win.__cstfAttachmentClearRequested = true;
+                selectedFiles = [];
+                resetAttachmentChrome();
+                renderAttachmentPreview([]);
               });
             }
 
             const destroy = () => {
               active = false;
               doc.removeEventListener('click', handleSendClick, true);
+              clearAttachmentPreview();
               if (bar.isConnected) bar.remove();
             };
             win.__cstfAttachmentController = {
-              version: '2026-08-23-attachment-v3',
+              version: '2026-08-23-attachment-v7',
               token: bindingToken,
               uploaderEpoch,
               fileInput,
@@ -5381,6 +5686,10 @@ with col_side:
     st.markdown("</div>", unsafe_allow_html=True)
 
 _has_text = bool(prompt and prompt.strip())
+# Only fingerprint files on an actual submit.  A large local TIFF should not
+# be hashed on unrelated Streamlit reruns while the user is still composing.
+if send_btn:
+    uploaded_images = _dedupe_uploaded_images(uploaded_images)
 _has_image = bool(uploaded_images)
 _user_submitted = send_btn and (_has_text or _has_image)
 
@@ -5404,13 +5713,11 @@ if _user_submitted:
             + ("…" if len(preview_failures) > 3 else "")
         )
 
-    media_authorized = bool(
-        uploaded_images
-        and st.session_state.get("agent_external_media_consent", False)
-    )
-    if uploaded_images and not media_authorized:
-        st.warning("附件已保留在本地消息预览中；本轮未向外部模型发送附件内容。")
-    external_preview_paths = [path for path, _name in preview_items] if media_authorized else []
+    # Restore the original main.py behavior: every selected attachment is
+    # sent to the active chat executor in the same multimodal request.  The
+    # local preview remains separate and is cleared by the browser bridge
+    # after submission.
+    external_preview_paths = [path for path, _name in preview_items]
 
     used_default_prompt = False
     if _has_text:
@@ -5453,9 +5760,6 @@ if _user_submitted:
             create=True,
         )
     st.session_state.messages.append(user_msg)
-    # Consent applies to this submission only; a later file selection must
-    # require a fresh affirmative action.
-    st.session_state["_attachment_consent_reset_pending"] = True
     # File uploaders cannot be cleared by assigning their instantiated widget
     # state. Rotate the key so the post-submit rerun mounts a fresh input.
     st.session_state["_attachment_uploader_epoch"] = _attachment_uploader_epoch + 1
@@ -5624,7 +5928,7 @@ if _user_submitted:
                         allow_spatial_metadata=bool(
                             st.session_state.get("agent_spatial_consent", False)
                         ),
-                        allow_external_media=media_authorized,
+                        allow_external_media=True,
                         image_paths=external_preview_paths,
                     )
 
@@ -5642,9 +5946,17 @@ if _user_submitted:
                     parsed_map = _parse_agent_map_command(reply)
                     if parsed_map is not None:
                         target_lat, target_lon, target_zoom, _cmd_span = parsed_map
+                        _map_label = _parse_agent_map_label(reply)
+                        _map_command = {
+                            "lat": target_lat,
+                            "lon": target_lon,
+                            "zoom": target_zoom,
+                        }
+                        if _map_label:
+                            _map_command["label"] = _map_label
                         queue_agent_command(
                             st.session_state,
-                            {"map": {"lat": target_lat, "lon": target_lon, "zoom": target_zoom}},
+                            {"map": _map_command},
                         )
                         clean_reply = _strip_map_command_from_reply(reply)
                         if not clean_reply:
@@ -7315,12 +7627,15 @@ components.html(
           const gap = Math.max(0, sideRect.left - mapRect.right);
           const available = Math.max(1, rowRect.width - gap);
           const pct = clamp(sidePct, 24, 48);
-          const sidePx = available * pct / 100;
-          const mapPx = available - sidePx;
-          [[nodes.mapCol, mapPx], [nodes.sideCol, sidePx]].forEach((pair) => {
-            setImp(pair[0], "flex", "0 0 " + pair[1] + "px");
-            setImp(pair[0], "width", pair[1] + "px");
-            setImp(pair[0], "max-width", pair[1] + "px");
+          const gapPx = Math.round(gap);
+          const nextSidePct = pct;
+          const mapPct = 100 - pct;
+          [[nodes.mapCol, mapPct], [nodes.sideCol, nextSidePct]].forEach((pair) => {
+            const basis = "calc(" + pair[1] + "% - " + gapPx + "px)";
+            setImp(pair[0], "flex", "1 1 " + basis);
+            setImp(pair[0], "width", "calc(" + pair[1] + "% - " + gapPx + "px)");
+            setImp(pair[0], "max-width", "calc(" + pair[1] + "% - " + gapPx + "px)");
+            setImp(pair[0], "min-width", "0");
           });
           syncResizeGeometry();
           return pct;
@@ -7649,14 +7964,15 @@ components.html(
               const gap = Math.max(0, sideRect.left - mapRect.right);
               const available = Math.max(1, rowRect.width - gap);
               const pct = clamp(sidePct, 24, 48);
-              const sidePx = available * pct / 100;
-              const mapPx = available - sidePx;
-              [[nodes.mapCol, mapPx], [nodes.sideCol, sidePx]].forEach((pair) => {
+              const gapPx = Math.round(gap);
+              const mapPct = 100 - pct;
+              [[nodes.mapCol, mapPct], [nodes.sideCol, pct]].forEach((pair) => {
                 const el = pair[0];
-                const px = pair[1];
-                setImp(el, "flex", "0 0 " + px + "px");
-                setImp(el, "width", px + "px");
-                setImp(el, "max-width", px + "px");
+                const basis = "calc(" + pair[1] + "% - " + gapPx + "px)";
+                setImp(el, "flex", "1 1 " + basis);
+                setImp(el, "width", "calc(" + pair[1] + "% - " + gapPx + "px)");
+                setImp(el, "max-width", "calc(" + pair[1] + "% - " + gapPx + "px)");
+                setImp(el, "min-width", "0");
               });
               sync();
               return pct;

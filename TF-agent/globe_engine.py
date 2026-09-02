@@ -1004,6 +1004,40 @@ def build_cesium_html(payload: dict, height_px: int = 700, full_viewport: bool =
   // ---- CSTF_MAP_V1 协议：READY / FLY_ACK / LAYER_*（targetOrigin 收紧到父窗口 origin） ----
   let _parentOrigin = "";
   const _cstfLayers = {{}};
+  let _aoiPreviewEntity = null;
+
+  function clearLocalAoiPreview() {{
+    if (!_aoiPreviewEntity) return;
+    try {{ viewer.entities.remove(_aoiPreviewEntity); }} catch (e) {{}}
+    _aoiPreviewEntity = null;
+    viewer.scene.requestRender();
+  }}
+
+  function showLocalAoiPreview(geometry) {{
+    clearLocalAoiPreview();
+    const ring = geometry && geometry.type === "Polygon" && geometry.coordinates
+      ? geometry.coordinates[0]
+      : null;
+    if (!Array.isArray(ring) || ring.length < 4) return;
+    const flat = [];
+    ring.forEach(function(coord) {{
+      if (Array.isArray(coord) && coord.length >= 2) {{
+        flat.push(Number(coord[0]), Number(coord[1]));
+      }}
+    }});
+    if (flat.length < 8) return;
+    _aoiPreviewEntity = viewer.entities.add({{
+      polygon: {{
+        hierarchy: Cesium.Cartesian3.fromDegreesArray(flat),
+        material: Cesium.Color.fromBytes(46, 106, 192, 70),
+        height: 0,
+        outline: true,
+        outlineColor: Cesium.Color.fromBytes(127, 178, 255, 245),
+        perPositionHeight: false,
+      }},
+    }});
+    viewer.scene.requestRender();
+  }}
 
   function postToParent(msg) {{
     if (!window.parent) return;
@@ -1079,12 +1113,14 @@ def build_cesium_html(payload: dict, height_px: int = 700, full_viewport: bool =
       fill: hexToCesiumColor(payload.color || "#e41a1c", payload.alpha != null ? payload.alpha : 0.5),
       strokeWidth: 2,
     }}).then(function(ds) {{
+      if (String(layerId).indexOf("aoi:") === 0) clearLocalAoiPreview();
       ds.name = payload.name || layerId;
       if (_cstfLayers[layerId]) {{
         viewer.dataSources.remove(_cstfLayers[layerId]);
       }}
       viewer.dataSources.add(ds);
       _cstfLayers[layerId] = ds;
+      if (String(layerId).indexOf("aoi:") === 0) setStatus("AOI 已回显");
       sendLayerAck(payload.command_id, layerId, true);
       viewer.scene.requestRender();
     }}).catch(function(err) {{
@@ -1095,6 +1131,7 @@ def build_cesium_html(payload: dict, height_px: int = 700, full_viewport: bool =
 
   function removeCstfLayer(payload) {{
     const layerId = payload.layer_id || "";
+    if (String(layerId).indexOf("aoi:") === 0) clearLocalAoiPreview();
     const ds = _cstfLayers[layerId];
     if (ds) {{
       viewer.dataSources.remove(ds);
@@ -1175,6 +1212,8 @@ def build_cesium_html(payload: dict, height_px: int = 700, full_viewport: bool =
     mode: "",          // "" | "click" | "rect" | "poly"
     handler: null,
     rectStart: null,
+    rectStartScreen: null,
+    rectEntity: null,
     polyPts: [],
     polyEntity: null,
   }};
@@ -1194,8 +1233,17 @@ def build_cesium_html(payload: dict, height_px: int = 700, full_viewport: bool =
       viewer.entities.remove(aoi.polyEntity);
       aoi.polyEntity = null;
     }}
+    if (aoi.rectEntity) {{
+      viewer.entities.remove(aoi.rectEntity);
+      aoi.rectEntity = null;
+    }}
     aoi.polyPts = [];
     aoi.rectStart = null;
+    aoi.rectStartScreen = null;
+    try {{
+      viewer.scene.screenSpaceCameraController.enableInputs = !mode;
+      viewer.scene.canvas.style.cursor = mode ? "crosshair" : "default";
+    }} catch (e) {{}}
     if (!mode) return;
     aoi.handler = new Cesium.ScreenSpaceEventHandler(viewer.scene.canvas);
     const pickPos = function(position) {{
@@ -1207,6 +1255,11 @@ def build_cesium_html(payload: dict, height_px: int = 700, full_viewport: bool =
         lat: Cesium.Math.toDegrees(c.latitude),
       }};
     }};
+    setStatus(
+      mode === "click" ? "点选模式：点击地图选择一点" :
+      mode === "rect" ? "矩形模式：按住鼠标拖拽框选" :
+      "多边形模式：左键加点，右键完成"
+    );
     const toRing = function(pts) {{
       const ring = pts.map(function(p) {{ return [p.lon, p.lat]; }});
       if (ring.length > 0) {{
@@ -1236,11 +1289,50 @@ def build_cesium_html(payload: dict, height_px: int = 700, full_viewport: bool =
     if (mode === "rect") {{
       aoi.handler.setInputAction(function(movement) {{
         aoi.rectStart = pickPos(movement.position);
+        aoi.rectStartScreen = {{
+          x: Number(movement.position.x),
+          y: Number(movement.position.y),
+        }};
       }}, Cesium.ScreenSpaceEventType.LEFT_DOWN);
+      aoi.handler.setInputAction(function(movement) {{
+        if (!aoi.rectStart) return;
+        const p = pickPos(movement.endPosition);
+        if (!p) return;
+        const west = Math.min(aoi.rectStart.lon, p.lon);
+        const east = Math.max(aoi.rectStart.lon, p.lon);
+        const south = Math.min(aoi.rectStart.lat, p.lat);
+        const north = Math.max(aoi.rectStart.lat, p.lat);
+        if (aoi.rectEntity) viewer.entities.remove(aoi.rectEntity);
+        aoi.rectEntity = viewer.entities.add({{
+          rectangle: {{
+            coordinates: Cesium.Rectangle.fromDegrees(west, south, east, north),
+            material: Cesium.Color.fromBytes(46, 106, 192, 55),
+            height: 0,
+            outline: true,
+            outlineColor: Cesium.Color.fromBytes(127, 178, 255, 220),
+            outlineWidth: 2,
+          }},
+        }});
+        setStatus("矩形绘制中…松开鼠标完成");
+        viewer.scene.requestRender();
+      }}, Cesium.ScreenSpaceEventType.MOUSE_MOVE);
       aoi.handler.setInputAction(function(movement) {{
         if (!aoi.rectStart) return;
         const p = pickPos(movement.position);
         if (!p) return;
+        const startScreen = aoi.rectStartScreen || {{ x: movement.position.x, y: movement.position.y }};
+        const dx = Number(movement.position.x) - Number(startScreen.x);
+        const dy = Number(movement.position.y) - Number(startScreen.y);
+        if (Math.hypot(dx, dy) < 8) {{
+          aoi.rectStart = null;
+          aoi.rectStartScreen = null;
+          if (aoi.rectEntity) {{
+            viewer.entities.remove(aoi.rectEntity);
+            aoi.rectEntity = null;
+          }}
+          setStatus("矩形模式：请按住鼠标拖拽框选");
+          return;
+        }}
         const w = aoi.rectStart.lon, s = aoi.rectStart.lat;
         aoiSetMode("");
         sendAoi("selected", {{
@@ -1284,6 +1376,9 @@ def build_cesium_html(payload: dict, height_px: int = 700, full_viewport: bool =
 
   function sendAoi(kind, geometry, source, label) {{
     const msg = {{ kind: kind, geometry: geometry, source: source || "", label: label || null }};
+    if (kind === "cleared") clearLocalAoiPreview();
+    else showLocalAoiPreview(geometry);
+    setStatus(kind === "cleared" ? "AOI 正在清除…" : "AOI 正在同步…");
     try {{
       const channelQuery = "?channel_id=" + encodeURIComponent(CFG.channelId || "default");
       fetch("./api/map/aoi" + channelQuery, {{
@@ -1291,11 +1386,17 @@ def build_cesium_html(payload: dict, height_px: int = 700, full_viewport: bool =
         headers: {{ "Content-Type": "application/json" }},
         body: JSON.stringify(msg),
         cache: "no-store",
+      }}).then(function(resp) {{
+        if (!resp || !resp.ok) throw new Error("HTTP " + (resp && resp.status));
+        setStatus(kind === "cleared" ? "AOI 已清除" : "AOI 已选定，已同步");
+        return resp;
       }}).catch(function(e) {{
         console.warn("[AOI] server push failed", e);
+        setStatus(kind === "cleared" ? "AOI 清除失败" : "AOI 发送失败，请重试");
       }});
     }} catch (e) {{
       console.warn("[AOI] server push failed", e);
+      setStatus(kind === "cleared" ? "AOI 清除失败" : "AOI 发送失败，请重试");
     }}
     postToParent({{
       type: kind === "cleared" ? "CSTF_AOI_CLEARED" : "CSTF_AOI_SELECTED",
@@ -1305,8 +1406,6 @@ def build_cesium_html(payload: dict, height_px: int = 700, full_viewport: bool =
       label: label || null,
       ts: Date.now(),
     }});
-    if (kind === "cleared") setStatus("AOI 已清除");
-    else setStatus("AOI 已发送，等待确认…");
   }}
 
   function aoiCurrentView() {{

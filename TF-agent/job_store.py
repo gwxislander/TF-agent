@@ -14,6 +14,7 @@ import sqlite3
 import threading
 import time
 import uuid
+from contextlib import closing
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -112,13 +113,17 @@ class JobStore:
         if os.path.isfile(self.db_path) and not self._has_sqlite_header(self.db_path):
             self._preserve_corrupt_ledger()
         try:
-            with self._connect() as conn:
+            # sqlite3.Connection's context manager commits/rolls back but does
+            # not close the handle.  ``closing`` is required here so the
+            # corruption handler can move the database on Windows, where an
+            # open handle makes ``shutil.move`` fail with WinError 32.
+            with closing(self._connect()) as conn:
                 self._create_schema(conn)
                 self._validate_rows(conn)
         except (sqlite3.DatabaseError, ValueError, TypeError, json.JSONDecodeError):
             # Never delete a damaged ledger. Preserve it for diagnosis and start clean.
             self._preserve_corrupt_ledger()
-            with self._connect() as conn:
+            with closing(self._connect()) as conn:
                 self._create_schema(conn)
 
     @staticmethod

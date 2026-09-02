@@ -8,8 +8,9 @@ import re
 from typing import Any
 
 _ABS_PATH_RE = re.compile(
-    r"(?!(?:https?|ftp|file)://)(?:[A-Za-z]:[\\/][^\s,，;；)）]+|\\\\[^\s,，;；)）]+|/(?:Users|home|private|tmp|var|opt|Volumes|mnt|srv|workspace|app|data)/[^\s,，;；)）]+)"
+    r"(?:[A-Za-z]:[\\/][^\s,，;；)）]+|\\\\[^\s,，;；)）]+|/(?:Users|home|private|tmp|var|opt|Volumes|mnt|srv|workspace|app|data)/[^\s,，;；)）]+)"
 )
+_WEB_URL_RE = re.compile(r"(?i)\b(?:https?|ftp)://[^\s<>\"']+")
 _SECRET_RE = re.compile(
     r"(?i)(?:api[_-]?key|token|secret|password|authorization)\s*[:=]\s*[^\s,;，；]+"
 )
@@ -56,7 +57,17 @@ def sanitize_external_text(text: Any) -> str:
     value = _SECRET_RE.sub("<redacted>", value)
     value = _BARE_PROVIDER_KEY_RE.sub("<redacted>", value)
     value = _URL_CREDENTIAL_RE.sub(r"\1<redacted>@", value)
-    return _ABS_PATH_RE.sub("<local-path>", value)
+    # Web URLs must remain intact. Running the absolute-path expression over
+    # the whole string makes the tail of ``https:/`` look like a Windows drive
+    # path (``s:/``), and URL paths such as ``/data/...`` look local as well.
+    chunks = []
+    cursor = 0
+    for match in _WEB_URL_RE.finditer(value):
+        chunks.append(_ABS_PATH_RE.sub("<local-path>", value[cursor:match.start()]))
+        chunks.append(match.group(0))
+        cursor = match.end()
+    chunks.append(_ABS_PATH_RE.sub("<local-path>", value[cursor:]))
+    return "".join(chunks)
 
 
 def redact_spatial_metadata(text: Any) -> str:

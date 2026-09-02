@@ -223,6 +223,61 @@ def test_malformed_job_row_is_preserved_before_rebuilding_ledger(tmp_path):
     assert list(tmp_path.glob("jobs-row-corrupt.sqlite3.corrupt-*"))
 
 
+def test_corrupt_ledger_is_quarantined_after_sqlite_connection_closes(tmp_path, monkeypatch):
+    """The ledger must be closed before Windows attempts to move its DB file."""
+    path = tmp_path / "jobs-close-before-quarantine.sqlite3"
+    with sqlite3.connect(path) as conn:
+        conn.execute("""CREATE TABLE jobs (
+            job_id TEXT PRIMARY KEY, task TEXT NOT NULL, kind TEXT NOT NULL,
+            plan_id TEXT, status TEXT NOT NULL, progress INTEGER NOT NULL,
+            attempt INTEGER NOT NULL, started_at TEXT, updated_at TEXT NOT NULL,
+            artifact_ids TEXT NOT NULL, error_summary TEXT, metadata TEXT NOT NULL
+        )""")
+        conn.execute(
+            "INSERT INTO jobs(job_id,task,kind,status,progress,attempt,updated_at,artifact_ids,metadata) "
+            "VALUES(?,?,?,?,?,?,?,?,?)",
+            ("job-corrupt", "task", "kind", "QUEUED", 0, 0, "now", "[]", "not-json"),
+        )
+
+    connections = []
+    closed_connection_ids = set()
+
+    class TrackingConnection(sqlite3.Connection):
+        def close(self):
+            closed_connection_ids.add(id(self))
+            return super().close()
+
+    def tracked_connect():
+        conn = sqlite3.connect(
+            path,
+            timeout=10,
+            isolation_level=None,
+            factory=TrackingConnection,
+        )
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=10000")
+        conn.execute("PRAGMA journal_mode=WAL")
+        connections.append(conn)
+        return conn
+
+    original_preserve = JobStore._preserve_corrupt_ledger
+    preserve_observations = []
+
+    def assert_closed_before_preserve(self):
+        preserve_observations.append(
+            all(id(conn) in closed_connection_ids for conn in connections)
+        )
+        return original_preserve(self)
+
+    monkeypatch.setattr(JobStore, "_connect", staticmethod(tracked_connect))
+    monkeypatch.setattr(JobStore, "_preserve_corrupt_ledger", assert_closed_before_preserve)
+
+    JobStore(str(path))
+
+    assert preserve_observations == [True]
+    assert all(id(conn) in closed_connection_ids for conn in connections)
+
+
 def test_corrupt_ledger_backup_does_not_overwrite_same_second(tmp_path, monkeypatch):
     path = tmp_path / "jobs.sqlite3"
     monkeypatch.setattr("job_store.time.strftime", lambda *args, **kwargs: "20260822000000")

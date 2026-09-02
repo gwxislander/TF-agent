@@ -244,7 +244,7 @@ def parse_system_command(text: str) -> Optional[Dict[str, Any]]:
     m = _JSON_BLOCK_RE.search(text)
     if m:
         try:
-            return json.loads(m.group(1))
+            return _normalize_command_aliases(json.loads(m.group(1)))
         except json.JSONDecodeError:
             pass
     cmd: Dict[str, Any] = {}
@@ -265,11 +265,40 @@ def parse_system_command(text: str) -> Optional[Dict[str, Any]]:
     return cmd or None
 
 
+def _normalize_command_aliases(command: Any) -> Any:
+    """Normalize compatible legacy map shapes before strict schema validation.
+
+    Some Agent responses use ``{"map": {"center": [lat, lon], "zoom": 9}}``
+    while the internal CSTF protocol uses explicit ``lat``/``lon`` fields.
+    Keep the public command schema strict after this lossless adapter so the
+    rest of the execution path has one canonical representation.
+    """
+    if not isinstance(command, dict):
+        return command
+    normalized = dict(command)
+    map_cmd = normalized.get("map")
+    if isinstance(map_cmd, dict) and "lat" not in map_cmd and "lon" not in map_cmd:
+        center = map_cmd.get("center")
+        lat = lon = None
+        if isinstance(center, (list, tuple)) and len(center) >= 2:
+            lat, lon = center[0], center[1]
+        elif isinstance(center, dict):
+            lat = center.get("lat", center.get("latitude"))
+            lon = center.get("lon", center.get("longitude"))
+        if lat is not None and lon is not None:
+            map_cmd = dict(map_cmd)
+            map_cmd.pop("center", None)
+            map_cmd["lat"] = lat
+            map_cmd["lon"] = lon
+            normalized["map"] = map_cmd
+    return normalized
+
+
 def _validate_command(command: Any) -> Dict[str, Any]:
     """调用统一 Schema；错误只保留用户可理解的安全摘要。"""
     from agent_command_schema import validate_system_command
 
-    validated = validate_system_command(command)
+    validated = validate_system_command(_normalize_command_aliases(command))
     sidebar = validated.get("sidebar_states") or {}
     unknown_sidebar = set(sidebar) - (set(SIDEBAR_KEY_MAP) | {"workspace_tab"})
     if unknown_sidebar:
@@ -289,7 +318,7 @@ _RE_MAP_ZOOM = re.compile(
     re.IGNORECASE,
 )
 _RE_MAP_INTENT = re.compile(
-    r"(已定位|已跳转|已将地图|地图视角|视角已|飞到|定位到|跳转到|挪到|中心点)",
+    r"(已定位|已跳转|已将地图|已为您定位|地图视角|视角已|飞到|定位到|定位至|跳转到|挪到|中心点)",
 )
 
 
