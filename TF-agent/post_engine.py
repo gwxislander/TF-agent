@@ -1,4 +1,5 @@
 import os
+import sys
 import glob
 import json
 import hashlib
@@ -11,6 +12,14 @@ from tqdm import tqdm
 import geopandas as gpd
 from shapely.geometry import shape
 from agent_context_policy import safe_error_summary
+
+# Windows 控制台默认 GBK 编码，无法编码 emoji（✅/❌/⚠️/🗺️ 等），
+# 直接 logger 打印会抛 UnicodeEncodeError。强制 UTF-8 输出避免崩掉。
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 
 # 累加缓存（_NUMERATOR/_DENOMINATOR）复用安全门闩：
 # 仅当 manifest 存在且 fingerprint 完全一致才允许复用；否则视为不可信旧缓存，

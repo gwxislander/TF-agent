@@ -1,4 +1,5 @@
 import os
+import sys
 import time
 import glob
 import torch
@@ -11,11 +12,36 @@ from torch.utils.data import Dataset, DataLoader
 from torch.cuda.amp import autocast
 import datetime  # ✅ 新增：用于显示时间
 
+# Windows 控制台默认 GBK 编码，无法编码 emoji（✔/❌/✅ 等），会导致
+# print 抛 UnicodeEncodeError，即使推理已成功也会被误判为失败。
+# 这里强制 stdout/stderr 使用 UTF-8，避免 GBK 控制台崩掉。
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 # 假设模型文件名为 YYnet.py
 from YYnet import CDNet
 from agent_context_policy import safe_error_summary
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
+
+def _resolve_device(device) -> str:
+    """把调用方可能传入的 'auto'/''/None 规范化为有效设备字符串。
+
+    torch.load(map_location=...) 与 model.to(...) 只接受 'cuda'/'cpu' 等有效值，
+    若直接传字符串 'auto' 会抛 RuntimeError。统一在此解析为实际可用的设备。
+    """
+    try:
+        if device and str(device).lower() not in ("auto", "none", "cpu", "cuda"):
+            # 其它字符串（如 'cuda:0'）原样返回，交由 torch 校验
+            return str(device)
+    except Exception:
+        pass
+    import torch as _t
+    return "cuda" if _t.cuda.is_available() else "cpu"
 
 
 # =======================================================
@@ -240,6 +266,7 @@ class SmartStitcher:
 #  7. ✅ 主处理流程 (装载物理刹车 stop_callback)
 # =======================================================
 def process_geotiff(model, tiff_path, output_path, device, current_idx=0, total_batch=0, stop_callback=None):
+    device = _resolve_device(device)
     time_str = datetime.datetime.now().strftime("%H:%M:%S")
     progress_info = f"[{current_idx}/{total_batch}]" if total_batch > 0 else ""
 
@@ -324,6 +351,7 @@ def process_geotiff(model, tiff_path, output_path, device, current_idx=0, total_
 # =======================================================
 def load_model(model_path, device):
     print(f">>> 加载模型: {os.path.basename(model_path)}")
+    device = _resolve_device(device)
     model = CDNet(backbone='resnet50', output_stride=16, img_size=1024,
                   n_class=1, img_chan=3, chan_num=64, fuzzy_num=16)
     # 安全加载：weights_only=True 拒绝 pickle 任意对象，防止投毒权重 RCE。

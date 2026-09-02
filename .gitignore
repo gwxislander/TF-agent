@@ -48,6 +48,38 @@ qwen_rs_agent_lora/
 Qwen_Agent_Merged/
 Llama-Factory/
 llamaboard_cache/
+
+# --- 仓库内置矢量资源（TF-agent/data/）: 先放行目录，再放行核心 shp，其余排除 ---
+# Windows 下 TF-agent/data 与 TF-agent/DATA 为同一物理目录，规则统一处理。
+# 注意：必须先 !TF-agent/data/ 放行目录本身（否则子文件 ! 无法生效）。
+!TF-agent/data/
+TF-agent/data/reports/
+TF-agent/data/sqq_TF_20-25/
+TF-agent/data/max_water_extent23.shp
+TF-agent/data/max_water_extent23.shx
+TF-agent/data/max_water_extent23.dbf
+TF-agent/data/max_water_extent23.prj
+TF-agent/data/max_water_extent23.cpg
+TF-agent/data/max_water_extent23.fix
+TF-agent/data/*.sqlite3
+TF-agent/data/*.json
+TF-agent/data/*.csv
+TF-agent/data/*.7z
+TF-agent/data/*.xml
+# 放行核心 shp 资源（china_costal 任务 AOI 区分、points_export 指数法点位）
+!TF-agent/data/china_costal.shp
+!TF-agent/data/china_costal.shx
+!TF-agent/data/china_costal.dbf
+!TF-agent/data/china_costal.prj
+!TF-agent/data/china_costal.cpg
+!TF-agent/data/china_costal.sbn
+!TF-agent/data/china_costal.sbx
+!TF-agent/data/points_export.shp
+!TF-agent/data/points_export.shx
+!TF-agent/data/points_export.dbf
+!TF-agent/data/points_export.prj
+!TF-agent/data/points_export.cpg
+!TF-agent/data/points_export.fix
 rs_knowledge_db/
 research/jb/e1_workspace/outputs_e1/
 research/jb/e1_workspace/E1_rasters/

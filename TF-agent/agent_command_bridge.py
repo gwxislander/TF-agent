@@ -144,6 +144,19 @@ def init_ui_session_defaults(state: Dict[str, Any]) -> None:
     _repo_root = os.path.normpath(
         os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
     )
+    # 仓库内置矢量资源（TF-agent/data/）：优先使用，保证同门拉下即可用；
+    # 不存在时回退到开发机外部旧路径（本机体验不变）。
+    _data_dir = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "data"))
+
+    def _local_or_fallback(name: str, *fallbacks: str) -> str:
+        local = os.path.join(_data_dir, name)
+        if os.path.exists(local):
+            return local
+        for fb in fallbacks:
+            if fb and os.path.exists(fb):
+                return fb
+        return ""
+
     defaults = {
         "ui_workflow": "潮滩推理",
         "ui_run_mode": "dl",
@@ -154,12 +167,17 @@ def init_ui_session_defaults(state: Dict[str, Any]) -> None:
             r"E:\Code\GEE\best_train_loss_model_resnet50.pth"
         ),
         "ui_shp_path": _default_ui_path(
-            r"E:\Code\GEE\jb\water-line\max_water_extent23.shp"
+            r"E:\Code\GEE\research\jb\water-line\max_water_extent23.shp"
         ),
-        "ui_points_shp": _default_ui_path(
-            os.path.join(_repo_root, "jb", "point", "points_export.shp")
+        "ui_points_shp": _local_or_fallback(
+            "points_export.shp",
+            r"E:\Code\GEE\research\jb\point\points_export.shp",
+            os.path.join(_repo_root, "jb", "point", "points_export.shp"),
         ),
-        "ui_task_aoi_shp": _default_ui_path(r"E:\Data\CHINA_tf_city\china_costal.shp"),
+        "ui_task_aoi_shp": _local_or_fallback(
+            "china_costal.shp",
+            r"E:\Data\CHINA_tf_city\china_costal.shp",
+        ),
         "ui_inference_mode": "深度学习",
         "ui_adaptive_mode": False,
         "ui_prob_th": 0.05,
@@ -173,7 +191,10 @@ def init_ui_session_defaults(state: Dict[str, Any]) -> None:
         "ui_e1_compare_sources": [],
         "ui_e1_export_maps": True,
         "ui_e1_export_heatmap": True,
-        "ui_m4_roi_path": _default_ui_path(r"E:\Data\CHINA_tf_city\china_costal.shp"),
+        "ui_m4_roi_path": _local_or_fallback(
+            "china_costal.shp",
+            r"E:\Data\CHINA_tf_city\china_costal.shp",
+        ),
         "ui_m4_roi_name": "",
         "ui_m4_start_date": "2020-01-01",
         "ui_m4_end_date": "2020-01-31",

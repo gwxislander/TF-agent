@@ -106,6 +106,26 @@ KMP_DUPLICATE_LIB_OK=TRUE
 
 ---
 
+### 矢量资源（内置）
+
+仓库内 **`TF-agent/data/`** 已内置核心矢量资源，克隆后侧栏会自动指向这些路径：
+
+| 文件 | 用途 |
+|------|------|
+| `data/china_costal.shp` | **全国省片 AOI 分区**，按 `name`（如 `zhejiang1`/`fujian1`）区分各省任务研究区 |
+| `data/points_export.shp` | 指数法推理点位 |
+
+> 侧栏默认值优先使用仓库内 `data/` 路径；若不存在则回退到开发机旧外部路径。同门克隆后无需手动配置这两个矢量。
+
+**仍需自行准备的资源（体积大或按机器变化，未入库）**：
+
+- **模型权重 `best_train_loss_model_resnet50.pth`**（CDNet/ResNet50，约 112MB）——推理必需，复制任意路径后，在侧栏「路径与模型环境」→「提取模型权重」选择；
+- **水域约束 `max_water_extent23.shp`**（约 61MB，潮滩最大水域范围）——后处理约束，侧栏「路径与模型环境」选择；也可用 `research/jb/water-line/` 下的同名文件；
+- **原始影像目录**（如 `I:\GEE_data\20`）与输出目录——按本机路径在侧栏配置；
+- **官方潮滩成果矢量**（`china_tidal_flat_projected_YYYY.shp`，用于 M5/E1 基线）——需自行准备，见 `TF-agent/DATA/sqq_TF_20-25/` 示例。
+
+---
+
 ## 5. 启动方式
 
 ```powershell
