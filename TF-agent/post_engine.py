@@ -1,5 +1,10 @@
 import os
 import sys
+# Windows 下 numpy/scipy 等会初始化 Intel OpenMP 运行时，进程内重复加载会触发
+# "OMP: Error #15", 导致后处理崩溃。必须在 import 相关库之前设置（与 pre_engine 一致）。
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+os.environ.setdefault("KMP_INIT_AT_FORK", "FALSE")
+
 import glob
 import json
 import hashlib

@@ -1,5 +1,12 @@
 import os
 import sys
+# Windows 下 torch/numpy 等混合科学依赖会多次初始化 Intel OpenMP 运行时，
+# 若不设置会在运行时报 "OMP: Error #15 ... libiomp5md.dll already initialized"，
+# 导致推理中途崩溃。必须在 import torch 之前设置（与 agent.py 同规则）。
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+# 预防 single OpenMP runtime 绑定导致的性能/崩溃问题。
+os.environ.setdefault("KMP_INIT_AT_FORK", "FALSE")
+
 import time
 import glob
 import torch
