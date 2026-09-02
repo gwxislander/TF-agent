@@ -4368,6 +4368,7 @@ with st.sidebar:
             _run_label,
             type="primary",
             use_container_width=True,
+            key="ui_run_btn",
             disabled=st.session_state.is_running,
         )
 
