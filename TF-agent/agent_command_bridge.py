@@ -153,6 +153,38 @@ def _first_existing(*paths: str) -> str:
     return ""
 
 
+def _read_gee_project() -> str:
+    """解析 GEE Cloud Project：环境变量 → 项目文件 → credentials JSON。
+
+    与 m4_engine._resolve_ee_project 语义一致；返回空串表示未配置。
+    支持 earthengine set_project 写入的 ~/.config/earthengine/project。
+    """
+    for key in ("EE_PROJECT", "GOOGLE_CLOUD_PROJECT", "EARTHENGINE_PROJECT"):
+        val = (os.environ.get(key) or "").strip()
+        if val:
+            return val
+    cfg_dir = os.path.join(os.path.expanduser("~"), ".config", "earthengine")
+    for fname in ("project", "project_id"):
+        p = os.path.join(cfg_dir, fname)
+        try:
+            if os.path.isfile(p):
+                text = open(p, encoding="utf-8").read().strip()
+                if text:
+                    return text
+        except OSError:
+            pass
+    cred = os.path.join(cfg_dir, "credentials")
+    try:
+        if os.path.isfile(cred):
+            data = json.loads(open(cred, encoding="utf-8").read())
+            for k in ("project", "project_id", "cloud_project"):
+                if data.get(k):
+                    return str(data[k]).strip()
+    except (OSError, ValueError, TypeError):
+        pass
+    return ""
+
+
 def init_ui_session_defaults(state: Dict[str, Any]) -> None:
     """初始化侧栏 UI 绑定键（仅缺省时写入，不覆盖用户/Agent 已有值）。"""
     _repo_root = os.path.normpath(
@@ -226,7 +258,7 @@ def init_ui_session_defaults(state: Dict[str, Any]) -> None:
         "ui_m4_bands": ["B8", "B4", "B3", "B2", "B11"],
         "ui_m4_scale": 10,
         "ui_m4_gee_proxy": "",
-        "ui_m4_gee_project": os.environ.get("EE_PROJECT", "").strip(),
+        "ui_m4_gee_project": _read_gee_project(),
     }
     for k, v in defaults.items():
         if k not in state:
