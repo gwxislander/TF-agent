@@ -20,8 +20,9 @@ except ImportError:
 
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
-# Clash 默认混合代理端口（可在 .env 用 GEE_PROXY_URL 覆盖；默认 7890 为本机实测端口）
-DEFAULT_CLASH_PROXY = (os.environ.get("GEE_PROXY_URL") or "http://127.0.0.1:7890").strip()
+# GEE 网络代理默认：留空走直连（适用 VPN 全局/TUN 模式）。
+# 可用 .env 设 GEE_PROXY_URL（如 http://127.0.0.1:7890）作为默认，仅作 placeholder 提示。
+DEFAULT_CLASH_PROXY = (os.environ.get("GEE_PROXY_URL") or "").strip()
 
 # localtileserver 访问本机瓦片服务时若走系统代理(如 127.0.0.1:7892)会加载失败
 _NO_PROXY = "127.0.0.1,localhost,::1"
@@ -3535,12 +3536,9 @@ with st.sidebar:
             m4_gee_proxy = st.text_input(
                 "影像平台网络代理 (可选)",
                 key="ui_m4_gee_proxy",
-                placeholder=DEFAULT_CLASH_PROXY,
-                help="本机实测 Clash 端口 7890；可用 GEE_PROXY_URL 环境变量覆盖。留空走直连（需 VPN 全局）。",
+                placeholder=DEFAULT_CLASH_PROXY or "留空走直连（VPN 全局）",
+                help="留空=直连（需 VPN 全局/TUN）；或填 Clash 代理如 http://127.0.0.1:7890。可用 GEE_PROXY_URL 环境变量设默认。",
             )
-            # 未填过代理时，用 Clash 默认端口作为实际代理（保证 Google API 连通）
-            if not (m4_gee_proxy or "").strip() and DEFAULT_CLASH_PROXY:
-                m4_gee_proxy = DEFAULT_CLASH_PROXY
             m4_gee_project = st.text_input(
                 "影像平台项目 ID（必填）",
                 key="ui_m4_gee_project",
