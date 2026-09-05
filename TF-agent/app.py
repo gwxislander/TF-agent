@@ -210,6 +210,60 @@ def _dedupe_uploaded_images(uploaded_files):
     return unique
 
 
+def _format_agent_markdown(content: str) -> str:
+    """智能体回复的轻量前端格式化（仅展示层增强，不改原始语义）。
+
+    目的：让智能体长回复不再挤成一大段，增强分段、列表、重点高亮与
+    「模块化信息」（定位结果 / 当前状态 / 建议操作）的可读性。
+    只做展示增强，不改变存储的原始 content；保护代码块与已有结构。
+    """
+    if not content:
+        return content
+    text = str(content)
+
+    # 保护代码块：避免对 ```...``` 内部做任何替换
+    code_blocks = []
+    def _hold(m):
+        code_blocks.append(m.group(0))
+        return f"@@CODEBLOCK{len(code_blocks)-1}@@"
+    text = re.sub(r"```.*?```", _hold, text, flags=re.DOTALL)
+    text = re.sub(r"`[^`\n]+`", _hold, text)  # 行内代码也保护
+
+    # 1) 常见「模块化信息」标题：加醒目加粗（不改文字语义）
+    module_heads = [
+        "定位结果", "当前状态", "建议操作", "下一步建议", "可执行命令",
+        "执行结果", "分析结论", "区域范围", "任务计划", "注意事项",
+        "关键参数", "成果文件", "推荐操作", "说明",
+    ]
+    for head in module_heads:
+        pat = re.compile(
+            r"(?m)^(\s*)" + re.escape(head) + r"(\s*[:：]\s*)"
+        )
+        # 用函数替换，避免 replacement 字符串里的反斜杠/group 引用问题
+        text = pat.sub(lambda m: m.group(1) + "**" + head + "**" + m.group(2), text)
+
+    # 2) 列表块前确保空行（仅列表块首项补空行，保持连续列表紧凑）
+    #    匹配：非空行之后紧跟列表项时，在列表项前补一个空行
+    text = re.sub(
+        r"(?m)(?<=\n[^\n-*•\d])\n*(?=\s*[-*•]\s)",
+        "\n\n",
+        text,
+    )
+    text = re.sub(
+        r"(?m)(?<=\n[^\n\d])\n*(?=\s*\d+[.、)]\s)",
+        "\n\n",
+        text,
+    )
+    # 折叠 3+ 连续空行
+    text = re.sub(r"\n{3,}", "\n\n", text)
+
+    # 还原代码块
+    for i, block in enumerate(code_blocks):
+        text = text.replace(f"@@CODEBLOCK{i}@@", block)
+
+    return text
+
+
 def _render_chat_attachment_previews(message):
     """Render every live local preview attached to one chat message."""
     preview_paths = message.get("image_preview_paths") or []
@@ -2386,14 +2440,29 @@ st.markdown("""
         border: none !important;
     }
     [data-testid="stChatMessageAvatar"] {
-        background-color: #0d131d !important;
-        border: 1px solid #2c3649 !important;
+        background: linear-gradient(135deg, #2a3f66 0%, #1a2536 100%) !important;
+        border: 1px solid #3a62d7 !important;
+        box-shadow: 0 0 10px rgba(58, 98, 215, 0.35) !important;
     }
     /* Streamlit 1.62 renders the avatar as the first child without a stable
        data-testid; keep that actual container dark as well. */
     [data-testid="stChatMessage"] > div:first-child {
         background-color: #0d131d !important;
         border: 1px solid #2c3649 !important;
+    }
+    /* 用户头像：蓝紫色渐变 + 光晕（区分于助手） */
+    [data-testid="stChatMessage"]:has(.msg-role-user) [data-testid="stChatMessageAvatar"],
+    [data-testid="stChatMessage"]:has(.msg-role-user) > div:first-child {
+        background: linear-gradient(135deg, #3a62d7 0%, #273a5e 100%) !important;
+        border: 1px solid #5d82e8 !important;
+        box-shadow: 0 0 12px rgba(93, 130, 232, 0.45) !important;
+    }
+    /* 助手头像：绿色渐变 + 光晕 */
+    [data-testid="stChatMessage"]:has(.msg-role-assistant) [data-testid="stChatMessageAvatar"],
+    [data-testid="stChatMessage"]:has(.msg-role-assistant) > div:first-child {
+        background: linear-gradient(135deg, #4ea56a 0%, #1f3a28 100%) !important;
+        border: 1px solid #4ea56a !important;
+        box-shadow: 0 0 12px rgba(78, 165, 106, 0.45) !important;
     }
     .stTextInput>div>div>input, .stSelectbox>div>div>div { background-color: #252526 !important; color: #eeeeee !important; border: 1px solid #3d3d3d !important; border-radius: 2px !important; }
     .stTextInput>div>div>input:focus, .stSelectbox>div>div>div:focus { border-color: #3A62D7 !important; box-shadow: none !important; }
@@ -2404,12 +2473,14 @@ st.markdown("""
     .sub-title { font-size: 0.9rem; color: #888888 !important; margin-bottom: 15px; margin-top: 5px; padding-left: 14px;}
     .stProgress > div > div > div > div { background-color: #3A62D7 !important; }
     .msg-role {
-        display: inline-block;
-        padding: 0.1rem 0.45rem;
+        display: inline-flex;
+        align-items: center;
+        gap: 0.25rem;
+        padding: 0.15rem 0.5rem;
         border-radius: 999px;
-        font-size: 0.74rem;
+        font-size: 0.72rem;
         font-weight: 700;
-        margin-bottom: 0.35rem;
+        margin-bottom: 0.45rem;
         letter-spacing: 0.2px;
     }
     .msg-role-user {
@@ -2431,9 +2502,10 @@ st.markdown("""
         background: linear-gradient(180deg, #141a25 0%, #10151f 100%);
         border: 1px solid #2c3649;
         border-radius: 12px;
-        padding: 0.45rem 0.65rem;
-        margin-bottom: 0.45rem;
+        padding: 0.55rem 0.8rem;
+        margin-bottom: 0.55rem;
         box-sizing: border-box;
+        line-height: 1.65;
     }
     /* 对话采用双侧气泡：助手在左，用户在右。 */
     [data-testid="stChatMessage"]:has(.msg-role-assistant) {
@@ -2469,7 +2541,58 @@ st.markdown("""
     }
     [data-testid="stChatMessage"] [data-testid="stMarkdownContainer"] p {
         color: #e6ecf6 !important;
-        line-height: 1.5;
+        line-height: 1.7;
+        margin: 0.35rem 0 !important;
+    }
+    /* 消息正文：段落、列表、重点高亮排版优化 */
+    [data-testid="stChatMessage"] [data-testid="stMarkdownContainer"] {
+        color: #e6ecf6 !important;
+        font-size: 0.92rem;
+        line-height: 1.7;
+        word-break: break-word;
+    }
+    [data-testid="stChatMessage"] [data-testid="stMarkdownContainer"] p + p {
+        margin-top: 0.6rem !important;
+    }
+    [data-testid="stChatMessage"] [data-testid="stMarkdownContainer"] ul,
+    [data-testid="stChatMessage"] [data-testid="stMarkdownContainer"] ol {
+        margin: 0.4rem 0 !important;
+        padding-left: 1.25rem !important;
+    }
+    [data-testid="stChatMessage"] [data-testid="stMarkdownContainer"] li {
+        margin: 0.25rem 0 !important;
+        line-height: 1.6;
+    }
+    [data-testid="stChatMessage"] [data-testid="stMarkdownContainer"] li + li {
+        padding-top: 0.15rem !important;
+    }
+    /* 重点信息高亮（markdown **加粗** 与行内 code） */
+    [data-testid="stChatMessage"] [data-testid="stMarkdownContainer"] strong {
+        color: #ffd479 !important;
+        font-weight: 700;
+        background: rgba(255, 212, 121, 0.08);
+        padding: 0 0.2rem;
+        border-radius: 3px;
+    }
+    [data-testid="stChatMessage"] [data-testid="stMarkdownContainer"] code {
+        color: #7fd7ff !important;
+        background: #16202f !important;
+        padding: 0.1rem 0.3rem;
+        border-radius: 4px;
+        font-size: 0.85rem;
+    }
+    /* 标题（#/##/###）层级 */
+    [data-testid="stChatMessage"] [data-testid="stMarkdownContainer"] h1,
+    [data-testid="stChatMessage"] [data-testid="stMarkdownContainer"] h2,
+    [data-testid="stChatMessage"] [data-testid="stMarkdownContainer"] h3,
+    [data-testid="stChatMessage"] [data-testid="stMarkdownContainer"] h4 {
+        color: #f0f4fb !important;
+        margin: 0.6rem 0 0.35rem !important;
+        letter-spacing: 0.3px;
+    }
+    [data-testid="stChatMessage"] [data-testid="stMarkdownContainer"] h3 {
+        border-bottom: 1px solid #2c3649;
+        padding-bottom: 0.25rem;
     }
     :root {
         --workbench-h: calc(100vh - 3.5rem);
@@ -5216,13 +5339,16 @@ with col_side:
         # view uses it to remove this otherwise empty bordered chat container.
         st.markdown('<div class="cstf-chat-stream-marker" aria-hidden="true"></div>', unsafe_allow_html=True)
         for msg in st.session_state.messages:
-            avatar = "🧑‍💻" if msg["role"] == "user" else "🤖"
+            avatar = "🧑‍💻" if msg["role"] == "user" else "🛰️"
             with st.chat_message(msg["role"], avatar=avatar):
                 if msg["role"] == "user":
-                    st.markdown('<div class="msg-role msg-role-user">用户</div>', unsafe_allow_html=True)
+                    st.markdown('<div class="msg-role msg-role-user">🧑‍💻 用户</div>', unsafe_allow_html=True)
                 else:
-                    st.markdown('<div class="msg-role msg-role-assistant">智能体</div>', unsafe_allow_html=True)
-                st.markdown(msg["content"])
+                    st.markdown('<div class="msg-role msg-role-assistant">🛰️ 智能体</div>', unsafe_allow_html=True)
+                if msg["role"] == "assistant":
+                    st.markdown(_format_agent_markdown(msg["content"]))
+                else:
+                    st.markdown(msg["content"])
                 _render_chat_attachment_previews(msg)
 
     st.markdown('<div class="cstf-chat-compose-host">', unsafe_allow_html=True)
@@ -5766,7 +5892,7 @@ if _user_submitted:
 
     with chat_box:
         with st.chat_message("user", avatar="🧑‍💻"):
-            st.markdown('<div class="msg-role msg-role-user">用户</div>', unsafe_allow_html=True)
+            st.markdown('<div class="msg-role msg-role-user">🧑‍💻 用户</div>', unsafe_allow_html=True)
             st.markdown(display_prompt)
             _render_chat_attachment_previews(user_msg)
     if st.session_state.get("_conversation_store") is not None:
@@ -5783,8 +5909,8 @@ if _user_submitted:
     st.session_state["_attachment_uploader_epoch"] = _attachment_uploader_epoch + 1
 
     with chat_box:
-        with st.chat_message("assistant", avatar="🤖"):
-            st.markdown('<div class="msg-role msg-role-assistant">智能体</div>', unsafe_allow_html=True)
+        with st.chat_message("assistant", avatar="🛰️"):
+            st.markdown('<div class="msg-role msg-role-assistant">🛰️ 智能体</div>', unsafe_allow_html=True)
             with st.spinner("🧠 智能体思考中..."):
                 try:
                     import agent
