@@ -139,6 +139,20 @@ def _default_ui_path(path: str) -> str:
         return ""
 
 
+def _first_existing(*paths: str) -> str:
+    """返回第一个存在的路径；全不存在则返回空串。
+
+    用于"外部优先、仓库内置兜底"的路径默认值（如研究区域矢量）。
+    """
+    for p in paths:
+        try:
+            if p and os.path.exists(p):
+                return p
+        except Exception:
+            continue
+    return ""
+
+
 def init_ui_session_defaults(state: Dict[str, Any]) -> None:
     """初始化侧栏 UI 绑定键（仅缺省时写入，不覆盖用户/Agent 已有值）。"""
     _repo_root = os.path.normpath(
@@ -191,8 +205,9 @@ def init_ui_session_defaults(state: Dict[str, Any]) -> None:
         "ui_e1_compare_sources": [],
         "ui_e1_export_maps": True,
         "ui_e1_export_heatmap": True,
-        "ui_m4_roi_path": _local_or_fallback(
-            "china_costal.shp",
+        "ui_m4_roi_path": _first_existing(
+            r"E:\Data\CHINA_tf_city\china_costal.shp",      # 优先：本机原始区分 AOI 矢量
+            os.path.join(_data_dir, "china_costal.shp"),    # 回退：仓库内置副本
             r"E:\Data\CHINA_tf_city\china_costal.shp",
         ),
         "ui_m4_roi_name": "",
@@ -200,7 +215,10 @@ def init_ui_session_defaults(state: Dict[str, Any]) -> None:
         "ui_m4_end_date": "2020-01-31",
         "ui_m4_export_to": "drive",
         "ui_m4_drive_folder": "GEE_Downloads",
-        "ui_m4_local_dir": "",
+        "ui_m4_local_dir": _first_existing(
+            r"I:\GEE_data\20",                              # 默认：任务根目录（存在）
+            r"E:\Data\843output",
+        ),
         "ui_m4_cloud_limit": 60,
         "ui_m4_min_land": 5.0,
         "ui_m4_max_land": 95.0,
