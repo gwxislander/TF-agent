@@ -2149,6 +2149,31 @@ def _get_task_timeline():
     return tl
 
 
+def _on_run_inference_click() -> None:
+    """「开始模型提取」按钮的 on_click 回调。
+
+    st.button 的直接返回值在 Cesium globe iframe 重载 rerun 的竞争下可能丢失，
+    导致 run_btn 一直为 False。改用 on_click 回调在点击时确定执行，直接生成
+    推理计划并写入 _inference_pending_plan（与智能分析助手同链路）。
+    """
+    try:
+        from agent_command_bridge import propose_inference_plan as _propose_plan
+        st.session_state["_run_btn_clicked"] = True
+        if not st.session_state.get("is_running"):
+            _task = st.session_state.get("ui_selected_task") or ""
+            _prob = st.session_state.get("ui_prob_th") or 0.05
+            _cnt = st.session_state.get("ui_min_cnt") or 2
+            _force = bool(st.session_state.get("ui_force_rerun", False))
+            plan, errs = _propose_plan(
+                st.session_state,
+                {"task": _task, "prob_th": _prob, "min_cnt": _cnt, "force_rerun": _force},
+            )
+            st.session_state["_inference_pending_plan"] = plan
+            st.session_state["_inference_plan_confirmed"] = set()
+    except Exception:
+        pass
+
+
 def _tl_add(task_id, phase, message, *, status="PENDING", plan_id=None, tool=None,
             progress=None, details=None, artifacts=None, error=None):
     """记录时间线事件并原子落盘（失败静默，不阻塞主流程）。"""
@@ -4370,6 +4395,7 @@ with st.sidebar:
             use_container_width=True,
             key="ui_run_btn",
             disabled=st.session_state.is_running,
+            on_click=_on_run_inference_click,
         )
 
     stop_btn = st.button(
