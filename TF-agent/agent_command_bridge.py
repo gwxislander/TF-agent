@@ -257,7 +257,7 @@ def init_ui_session_defaults(state: Dict[str, Any]) -> None:
         "ui_m4_min_pixel_count": 1000,
         "ui_m4_bands": ["B8", "B4", "B3", "B2", "B11"],
         "ui_m4_scale": 10,
-        "ui_m4_gee_proxy": "",
+        "ui_m4_gee_proxy": os.environ.get("GEE_PROXY_URL", "").strip() or "",
         "ui_m4_gee_project": _read_gee_project(),
     }
     for k, v in defaults.items():
