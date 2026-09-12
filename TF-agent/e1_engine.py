@@ -50,7 +50,16 @@ def load_e1_report(workspace_dir: str, roi_name: str) -> Optional[Dict]:
         return None
     try:
         with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
+            report = json.load(f)
+        if not isinstance(report, dict):
+            return None
+        # Reports produced before the wrapper started adding provenance do not
+        # carry their own disk paths.  Reattach the deterministic paths on
+        # load so verification and the UI can recognize these valid reports.
+        report.setdefault("report_path", path)
+        report.setdefault("report_md_path", e1_report_md(workspace_dir, roi_name))
+        report.setdefault("workspace_dir", workspace_dir)
+        return report
     except Exception:
         return None
 
@@ -106,6 +115,7 @@ def run_e1_after_synthesis(
     export_disagreement_maps: bool = True,
     export_multi_product_heatmap: bool = True,
     logger: Callable = print,
+    stop_callback: Optional[Callable[[], bool]] = None,
 ) -> Optional[Dict]:
     """
     合成完成后运行 E1 多源对比。失败返回 None，不阻断主流程。
@@ -133,6 +143,9 @@ def run_e1_after_synthesis(
         return None
 
     try:
+        if stop_callback and stop_callback():
+            logger("[E1] 已收到中断请求，未启动精度评价。")
+            return None
         result = e1.run_pixel_comparison(
             reference=reference,
             target_path=target_shp,
@@ -143,6 +156,7 @@ def run_e1_after_synthesis(
             export_rasters=False,
             export_disagreement_maps=export_disagreement_maps,
             export_multi_product_heatmap=export_multi_product_heatmap and len(compare_sources) >= 2,
+            stop_callback=stop_callback,
         )
         result["report_path"] = e1_report_json(workspace_dir, roi_name)
         result["report_md_path"] = e1_report_md(workspace_dir, roi_name)
@@ -150,5 +164,8 @@ def run_e1_after_synthesis(
         logger(f"[E1] 报告已保存: {result['report_path']}")
         return result
     except Exception as exc:
+        if stop_callback and stop_callback():
+            logger("[E1] 精度评价已中断，未写入成功结果。")
+            return None
         logger(f"[E1] 多源一致性诊断失败: {safe_error_summary(exc)}")
         return None

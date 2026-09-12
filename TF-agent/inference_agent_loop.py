@@ -584,6 +584,24 @@ def execute_local_inference(
         if push_progress:
             push_progress(int(min(100, max(0, v))))
 
+    def cancelled_result(processed_tiles: int = 0) -> Dict[str, Any]:
+        """Return a stable non-committable result for a user stop request."""
+        return {
+            "success": False, "task_id": task_id, "plan_id": plan_id,
+            "tool": TOOL_NAME, "status": "cancelled",
+            "inputs": {"input_path": rel_path(input_dir), "model_id": MODEL_ID,
+                       "weight_id": plan.get("weight_id"), "device": device},
+            "parameters": {"prob_threshold": prob, "count_threshold": cnt},
+            "outputs": {},
+            "metrics": {
+                "elapsed_seconds": round(time.time() - started, 2),
+                "processed_tiles": processed_tiles,
+                "tif_count": 0,
+            },
+            "warnings": warnings,
+            "error": "推理被用户中断。",
+        }
+
     pre = pre_engine_mod if pre_engine_mod is not None else _default_pre_engine()
     post = post_engine_mod if post_engine_mod is not None else _default_post_engine()
 
@@ -741,6 +759,11 @@ def execute_local_inference(
                                            "processed_tiles": success_count, "tif_count": total},
                 "warnings": warnings, "error": err,
             }
+
+        # 后处理可能在最后一个分块/矢量写出后才观察到停止请求；
+        # 在成果校验和资产登记前再检查一次，禁止迟到成功穿透取消门闩。
+        if check_stop():
+            return cancelled_result(processed_tiles=success_count)
 
         # 后处理适配器返回 True 只是表示调用路径未抛错，不能替代对真实
         # 磁盘产物的存在性检查。否则适配器“空成功”会被上层当成可登记成果。

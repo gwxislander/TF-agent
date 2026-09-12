@@ -232,6 +232,129 @@ def _nodata_safe(value: Any) -> Optional[float]:
     return float(value)
 
 
+_MAP_PREVIEW_VERSION = "1"
+_MAP_PREVIEW_DEFAULT_MAX_PIXELS = 4_000_000
+_MAP_PREVIEW_DEFAULT_MAX_DIMENSION = 4096
+
+
+def prepare_map_asset(
+    path: str,
+    *,
+    max_pixels: int = _MAP_PREVIEW_DEFAULT_MAX_PIXELS,
+    max_dimension: int = _MAP_PREVIEW_DEFAULT_MAX_DIMENSION,
+) -> Optional[str]:
+    """Return a map-friendly raster path, creating a cached preview if needed.
+
+    E1 disagreement rasters can cover a national 30 m grid.  Serving such a
+    file directly through ``localtileserver`` is slow when it has no internal
+    overviews: even the first low-zoom tile may scan the entire GeoTIFF.  A
+    decimated GeoTIFF is sufficient for visualization while the original
+    remains the authoritative evaluation output.  The cache is invalidated by
+    source mtime/size and is written atomically, so a failed preview never
+    replaces the original file.
+    """
+    if not path:
+        return None
+    norm = os.path.normpath(os.path.abspath(str(path)))
+    if not os.path.isfile(norm):
+        return None
+    if os.path.splitext(norm)[1].lower() not in {".tif", ".tiff"}:
+        return norm
+    try:
+        max_pixels = max(1, int(max_pixels))
+        max_dimension = max(16, int(max_dimension))
+    except (TypeError, ValueError):
+        max_pixels = _MAP_PREVIEW_DEFAULT_MAX_PIXELS
+        max_dimension = _MAP_PREVIEW_DEFAULT_MAX_DIMENSION
+
+    try:
+        import rasterio
+        from affine import Affine
+
+        source_stat = os.stat(norm)
+        with rasterio.open(norm) as src:
+            width, height, count = int(src.width), int(src.height), int(src.count)
+            if width <= 0 or height <= 0 or count <= 0:
+                return norm
+            if width * height <= max_pixels and max(width, height) <= max_dimension:
+                return norm
+
+            scale = min(
+                1.0,
+                float(max_dimension) / float(max(width, height)),
+                (float(max_pixels) / float(width * height)) ** 0.5,
+            )
+            out_width = max(1, int(round(width * scale)))
+            out_height = max(1, int(round(height * scale)))
+            preview = os.path.splitext(norm)[0] + ".cstf-map-preview.tif"
+
+            if os.path.isfile(preview):
+                try:
+                    with rasterio.open(preview) as cached:
+                        tags = cached.tags()
+                        if (
+                            tags.get("cstf_preview_version") == _MAP_PREVIEW_VERSION
+                            and tags.get("cstf_source_mtime_ns") == str(source_stat.st_mtime_ns)
+                            and tags.get("cstf_source_size") == str(source_stat.st_size)
+                            and cached.width == out_width
+                            and cached.height == out_height
+                        ):
+                            return preview
+                except Exception:
+                    pass
+
+            data = src.read(
+                out_shape=(count, out_height, out_width),
+                resampling=rasterio.enums.Resampling.nearest,
+            )
+            profile = src.profile.copy()
+            profile.update(
+                driver="GTiff",
+                width=out_width,
+                height=out_height,
+                count=count,
+                transform=src.transform * Affine.scale(
+                    float(width) / float(out_width),
+                    float(height) / float(out_height),
+                ),
+                compress="lzw",
+            )
+            # Small previews need not be tiled; otherwise use conservative
+            # 256px blocks accepted by all GDAL versions.
+            if out_width >= 16 and out_height >= 16:
+                block_x = min(256, max(16, (out_width // 16) * 16))
+                block_y = min(256, max(16, (out_height // 16) * 16))
+                profile.update(tiled=True, blockxsize=block_x, blockysize=block_y)
+            else:
+                profile.pop("tiled", None)
+                profile.pop("blockxsize", None)
+                profile.pop("blockysize", None)
+
+            tmp = f"{preview}.tmp-{os.getpid()}"
+            try:
+                with rasterio.open(tmp, "w", **profile) as dst:
+                    dst.write(data)
+                    dst.update_tags(
+                        cstf_preview_version=_MAP_PREVIEW_VERSION,
+                        cstf_source_mtime_ns=str(source_stat.st_mtime_ns),
+                        cstf_source_size=str(source_stat.st_size),
+                    )
+                if os.path.isfile(tmp) and os.path.getsize(tmp) > 0:
+                    os.replace(tmp, preview)
+                    return preview
+            finally:
+                try:
+                    if os.path.exists(tmp):
+                        os.unlink(tmp)
+                except OSError:
+                    pass
+    except Exception:
+        # Preview generation is an optimization.  The caller can still try
+        # the authoritative path and report a precise tile error if it fails.
+        return norm
+    return norm
+
+
 def infer_raster_tile_params(path: str) -> dict:
     """与 2D 地图一致：单波段成果用 Reds 色图，nodata=0 透明背景。"""
     out: dict[str, Any] = {"indexes": None, "colormap": None, "nodata": None}

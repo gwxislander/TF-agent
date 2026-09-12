@@ -1039,6 +1039,7 @@ def _run_e1_step(step, workflow, *, exec_ctx, push_log, stop_event) -> Dict[str,
             export_multi_product_heatmap=p.get(
                 "export_multi_product_heatmap", True),
             logger=lg,
+            stop_callback=se,
         )
         if not report:
             return {"success": False, "report": None,
@@ -1140,6 +1141,28 @@ def _run_report_step(step, workflow, *, exec_ctx, push_log, stop_event) -> Dict[
     registry = (exec_ctx or {}).get("registry")
     pred = _find_prediction_asset(workflow, registry=registry)
     asset_key = (pred or {}).get("_key")
+    _terminal_logs = (exec_ctx or {}).get("terminal_logs")
+    if callable(_terminal_logs):
+        try:
+            _terminal_logs = _terminal_logs()
+        except Exception:
+            _terminal_logs = None
+    _provided_results = (exec_ctx or {}).get("execution_results")
+    _execution_results = dict(_provided_results) if isinstance(_provided_results, dict) else {}
+    if not _execution_results:
+        _step_result_names = {
+            TOOL_LOCAL_INFERENCE: "inference",
+            TOOL_GEE_DOWNLOAD: "gee",
+            TOOL_M5_CHANGE: "m5",
+            TOOL_E1_QUALITY: "e1",
+        }
+        for _wf_step in workflow.get("steps") or []:
+            if not isinstance(_wf_step, dict):
+                continue
+            _wf_result = _wf_step.get("result")
+            _result_name = _step_result_names.get(_wf_step.get("tool"))
+            if _result_name and isinstance(_wf_result, dict):
+                _execution_results[_result_name] = _wf_result
     try:
         result = are.generate_asset_report(
             task=task_id,
@@ -1148,6 +1171,8 @@ def _run_report_step(step, workflow, *, exec_ctx, push_log, stop_event) -> Dict[
             registry_path=(exec_ctx or {}).get("registry_path"),
             ref_shp=None,
             progress_callback=(exec_ctx or {}).get("push_progress"),
+            terminal_logs=_terminal_logs,
+            execution_results=_execution_results,
         )
     except Exception as e:  # noqa: BLE001
         return {

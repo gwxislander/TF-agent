@@ -11,6 +11,8 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
+from urllib.error import HTTPError
 
 _TF_AGENT = os.path.normpath(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "TF-agent")
@@ -237,6 +239,25 @@ class TestFunctionalAuditFixes(unittest.TestCase):
             globe_server.take_aoi_pending(channel_id="chan-a")["messages"][0]["geometry"]["id"],
             "a",
         )
+
+    def test_overlay_http_error_is_returned_without_urllib_scope_error(self):
+        """瓦片上游返回 HTTP 错误时，代理应返回该状态码而不是作用域异常。"""
+        token = "a" * 16
+        handler = object.__new__(globe_server._GlobeHandler)
+        handler.path = f"/overlay/{token}/1/2/3.png"
+        sent = []
+        handler._send = lambda *args, **kwargs: sent.append((args, kwargs))
+        with globe_server._lock:
+            globe_server._tile_templates[token] = "https://tiles.invalid/{z}/{x}/{y}.png"
+        try:
+            error = HTTPError("https://tiles.invalid/1/2/3.png", 503, "upstream unavailable", {}, None)
+            with patch.object(globe_server, "_fetch_upstream_tile", side_effect=error):
+                globe_server._GlobeHandler.do_GET(handler)
+        finally:
+            with globe_server._lock:
+                globe_server._tile_templates.pop(token, None)
+
+        self.assertEqual(sent[0][0][0], 503)
 
 
 if __name__ == "__main__":

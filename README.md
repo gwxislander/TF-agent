@@ -26,7 +26,7 @@ python -m streamlit run app.py --server.port 8501
 
 ### 同门 / 新机器拉取运行
 
-1. 克隆仓库：`git clone https://github.com/gwxislander/TF-agent.git && cd TF-agent`
+1. 克隆仓库：`git clone https://github.com/KD-CHL/TF-agent.git && cd TF-agent`
 2. 创建 Python 3.10 或 3.11 环境，并安装运行与测试依赖：`python -m pip install -r TF-agent/requirements.txt && python -m pip install -r TF-agent/requirements-test.txt`
 3. 配置密钥：`copy TF-agent\.env.example TF-agent\.env`，填入 `DASHSCOPE_API_KEY`
 4. 准备模型权重 `best_train_loss_model_resnet50.pth`（见下方说明），在侧栏「提取模型权重」中选择
@@ -41,7 +41,7 @@ python -m streamlit run app.py --server.port 8501
 因体积原因**不放入 Git 仓库**（`.gitignore` 已排除 `*.pth`）。获取方式：
 
 - 方式一：找师兄/师姐拷贝该文件（约 200–400 MB），放到任意目录后在侧栏选择；
-- 方式二：如仓库维护者已上传 GitHub Release，在 [Releases](https://github.com/gwxislander/TF-agent/releases) 下载；
+- 方式二：如仓库维护者已上传 GitHub Release，在 [Releases](https://github.com/KD-CHL/TF-agent/releases) 下载；
 - 方式三：自行训练（`TF-agent/train_agent.py` 提供了训练入口）。
 
 > 其它外部数据（AOI 矢量、潮滩数据集、M5 基线 SHP 等）同样按需准备，在侧栏对应输入框选择。
@@ -84,7 +84,7 @@ python -m pytest \
 ## 远程仓库
 
 ```text
-https://github.com/gwxislander/TF-agent.git
+https://github.com/KD-CHL/TF-agent.git
 ```
 
 ## 文档

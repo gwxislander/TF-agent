@@ -104,6 +104,36 @@ def _nonempty_file(path: Any) -> bool:
         return False
 
 
+def _resolve_registered_path(path: Any, registry_path: Optional[str] = None) -> str:
+    """Resolve registry paths without depending on the process working directory."""
+    raw = str(path or "").strip().strip('"').strip("'")
+    if not raw:
+        return ""
+    if not os.path.isabs(raw):
+        registry = registry_path or _default_registry_path()
+        raw = os.path.join(os.path.dirname(os.path.abspath(registry)), raw)
+    return os.path.normpath(os.path.abspath(raw))
+
+
+def _registered_final_tif(row: Dict[str, Any], registry_path: Optional[str] = None) -> str:
+    """Return a usable Final TIF, including one paired with a registered Final SHP."""
+    raw = str(row.get("file_path") or "")
+    candidates = []
+    declared_tif = row.get("final_tif")
+    if declared_tif:
+        candidates.append(declared_tif)
+    resolved = _resolve_registered_path(raw, registry_path)
+    if resolved:
+        candidates.append(resolved)
+        if resolved.lower().endswith(".shp"):
+            candidates.append(os.path.splitext(resolved)[0] + ".tif")
+    for candidate in candidates:
+        resolved_candidate = _resolve_registered_path(candidate, registry_path)
+        if _is_final_tif(resolved_candidate) and _nonempty_file(resolved_candidate):
+            return resolved_candidate
+    return ""
+
+
 def _safe_filename(part: str) -> str:
     s = re.sub(r"[^\w\u4e00-\u9fff.\-]", "_", str(part or ""), flags=re.UNICODE)
     s = re.sub(r"_+", "_", s).strip("_")
@@ -131,12 +161,73 @@ def get_eligible_assets(
     """返回某任务下已入库且文件仍存在的 Final TIF（按入库时间倒序）。"""
     out: Dict[str, Dict[str, Any]] = {}
     for key, row in _load_asset_registry(registry_path).items():
-        path = str(row.get("file_path") or "")
-        if row.get("task") == task and _is_final_tif(path) and _nonempty_file(path):
-            out[key] = dict(row)
+        tif_path = _registered_final_tif(row, registry_path)
+        if row.get("task") == task and tif_path:
+            item = dict(row)
+            item["file_path"] = tif_path
+            out[key] = item
     return dict(
         sorted(out.items(), key=lambda kv: str(kv[1].get("created_at") or ""), reverse=True)
     )
+
+
+def _collect_extraction_summary(task: str, registry_path: Optional[str] = None) -> Dict[str, Any]:
+    """Collect a complete, report-safe extraction summary from registered artifacts."""
+    registry = registry_path or _default_registry_path()
+    rows: List[Dict[str, Any]] = []
+    primary_tif = ""
+    primary_shp = ""
+    expects_shp = False
+    params: Dict[str, Any] = {}
+    warnings: List[str] = []
+    try:
+        registered = _load_asset_registry(registry)
+    except Exception as exc:
+        return {"assets": [], "warnings": [f"资产注册表读取失败: {_sanitize_text(exc)}"]}
+
+    for key, row in registered.items():
+        if not isinstance(row, dict) or row.get("task") != task:
+            continue
+        raw_path = str(row.get("file_path") or "")
+        resolved_path = _resolve_registered_path(raw_path, registry)
+        tif_path = _registered_final_tif(row, registry)
+        shp_path = resolved_path if resolved_path.lower().endswith(".shp") and _nonempty_file(resolved_path) else ""
+        expects_shp = expects_shp or resolved_path.lower().endswith(".shp") or bool(row.get("final_shp"))
+        declared_shp = row.get("final_shp")
+        if not shp_path and declared_shp:
+            candidate = _resolve_registered_path(declared_shp, registry)
+            if candidate.lower().endswith(".shp") and _nonempty_file(candidate):
+                shp_path = candidate
+        if tif_path and not primary_tif:
+            primary_tif = tif_path
+        if shp_path and not primary_shp:
+            primary_shp = shp_path
+        for field in ("prob_threshold", "min_count", "model_id", "weight_id", "device"):
+            if row.get(field) is not None and field not in params:
+                params[field] = row.get(field)
+        rows.append({
+            "key": str(key),
+            "method": str(row.get("method") or row.get("asset_type") or "unknown"),
+            "file": _safe_basename(tif_path or shp_path or resolved_path),
+            "format": "tif" if tif_path else ("shp" if shp_path else "unknown"),
+            "status": str(row.get("status") or "registered"),
+            "created_at": str(row.get("created_at") or ""),
+        })
+
+    if not rows:
+        warnings.append("该任务在 assets_registry.json 中没有登记资产")
+    if not primary_tif:
+        warnings.append("缺少可读取的 Final TIF，无法完成栅格统计")
+    if expects_shp and not primary_shp:
+        warnings.append("缺少可读取的 Final SHP，矢量成果清单不完整")
+    return {
+        "assets": rows,
+        "primary_tif": primary_tif,
+        "primary_shp": primary_shp,
+        "parameters": params,
+        "warnings": warnings,
+        "status": "complete" if primary_tif and (primary_shp or not expects_shp) else "partial",
+    }
 
 
 # ---- 栅格统计 ----
@@ -294,7 +385,10 @@ def _configure_matplotlib():
     import matplotlib.pyplot as plt
     from matplotlib import font_manager, rcParams
 
-    preferred = ["Microsoft YaHei", "SimHei", "Arial Unicode MS"]
+    preferred = [
+        "Microsoft YaHei", "SimHei", "Arial Unicode MS",
+        "PingFang SC", "Hiragino Sans GB", "STHeiti",
+    ]
     installed = {f.name for f in font_manager.fontManager.ttflist}
     for name in preferred:
         if name in installed:
@@ -350,6 +444,22 @@ def _fmt_bounds(bounds: Any) -> str:
     return f"{bounds.left:.5f}, {bounds.bottom:.5f}, {bounds.right:.5f}, {bounds.top:.5f}"
 
 
+def _terminal_report_lines(terminal_logs: Any = None, execution_results: Any = None) -> List[str]:
+    """Reuse the task-report sanitizer/formatter for the monitoring PDF."""
+    try:
+        from report_generator import _execution_result_lines, _normalize_terminal_logs
+
+        lines = list(_execution_result_lines(execution_results))
+        lines.extend(_normalize_terminal_logs(terminal_logs))
+    except Exception:
+        lines = []
+        if isinstance(terminal_logs, str):
+            lines = terminal_logs.splitlines()
+        elif isinstance(terminal_logs, (list, tuple)):
+            lines = [str(item or "") for item in terminal_logs]
+    return [_sanitize_text(line)[:220] for line in lines if str(line or "").strip()]
+
+
 def _render_pages(
     pdf,
     plt,
@@ -358,7 +468,10 @@ def _render_pages(
     stats: Dict[str, Any],
     preview: np.ndarray,
     ref_cmp: Optional[Dict[str, Any]],
+    extraction_summary: Optional[Dict[str, Any]],
     progress,
+    terminal_logs: Any = None,
+    execution_results: Any = None,
 ) -> None:
     """按 7 章节渲染报告页（与同门 report_engine 结构一致，文本全部消毒）。"""
     progress(0.55, "写入标题页")
@@ -391,6 +504,7 @@ def _render_pages(
     ax = fig.add_axes([0.06, 0.15, 0.88, 0.68])
     ax.axis("off")
     rows = [
+        ["提取状态", _sanitize_text((extraction_summary or {}).get("status") or "unknown")],
         ["文件", _safe_basename(stats.get("_tif_name") or "")],
         ["CRS", _sanitize_text(stats["crs"])],
         ["尺寸", f"{stats['width']} x {stats['height']}"],
@@ -402,6 +516,15 @@ def _render_pages(
         ["潮滩面积", f"{stats['area_km2']:.4f} km²"],
         ["覆盖比例", f"{stats['coverage_pct']:.2f}%"],
     ]
+    summary = extraction_summary or {}
+    if summary.get("primary_shp"):
+        rows.insert(2, ["Final SHP", _safe_basename(summary["primary_shp"])])
+    p = summary.get("parameters") or {}
+    if p:
+        rows.append(["提取参数", _sanitize_text(", ".join(f"{k}={v}" for k, v in p.items()))])
+    rows.append(["登记资产数", str(len(summary.get("assets") or []))])
+    for warning in (summary.get("warnings") or []):
+        rows.append(["完整性提示", _sanitize_text(warning)])
     if stats["area_estimated"]:
         rows.append(["面积备注", "CRS 为经纬度，面积按像元中心纬度近似估算"])
     table = ax.table(
@@ -459,6 +582,10 @@ def _render_pages(
         fontsize=12, color=INK,
     )
     _metric(fig, 0.08, 0.42, "当前成果潮滩面积", f"{stats['area_km2']:.4f} km²", RED)
+    assets = (extraction_summary or {}).get("assets") or []
+    if assets:
+        names = "；".join(f"{a.get('file')} ({a.get('format')})" for a in assets[:6])
+        fig.text(0.08, 0.30, f"本次提取资产：{_sanitize_text(names)}", fontsize=10, color=INK)
     pdf.savefig(fig)
     plt.close(fig)
 
@@ -501,8 +628,31 @@ def _render_pages(
         f"本次区域潮滩识别面积为 {stats['area_km2']:.4f} km²，覆盖比例 {stats['coverage_pct']:.2f}%。",
         fontsize=12, color=INK,
     )
-    fig.text(0.08, 0.62, "报告基于已入库成果自动生成，可用于成果归档、快速质检和后续人工复核。", fontsize=12, color=INK)
-    fig.text(0.08, 0.54, "若需要正式监测结论，建议结合多期同源数据、现场样本和参考真值进行复核。", fontsize=12, color=INK)
+    summary = extraction_summary or {}
+    fig.text(
+        0.08, 0.62,
+        f"提取闭环状态：{_sanitize_text(summary.get('status') or 'unknown')}；"
+        f"登记资产 {len(summary.get('assets') or [])} 项。",
+        fontsize=12, color=INK,
+    )
+    fig.text(0.08, 0.54, "报告基于已入库成果自动生成，可用于成果归档、快速质检和后续人工复核。", fontsize=12, color=INK)
+    fig.text(0.08, 0.46, "若需要正式监测结论，建议结合多期同源数据、现场样本和参考真值进行复核。", fontsize=12, color=INK)
+    # 把终端窗口中对复核最有价值的数值结果带入监测报告；完整日志仍
+    # 保留在任务执行面板，避免 PDF 被逐景进度刷屏。
+    terminal_lines = _terminal_report_lines(terminal_logs, execution_results)
+    if terminal_lines:
+        fig.text(0.08, 0.37, "终端运行结果（关键数据）", fontsize=11, weight="bold", color=INK)
+        display_lines = terminal_lines[:14]
+        if len(terminal_lines) > len(display_lines):
+            display_lines[-1] = f"…（共 {len(terminal_lines)} 行，详见任务终端日志）…"
+        ax = fig.add_axes([0.08, 0.07, 0.84, 0.27])
+        ax.axis("off")
+        ax.text(
+            0.0, 1.0, "\n".join(display_lines), va="top", ha="left",
+            # 使用已配置的 CJK 无衬线字体，避免 DejaVu Sans Mono 把中文
+            # 终端结果渲染成方框；报告可读性优先于等宽对齐。
+            fontsize=7.5, color=INK, family="sans-serif",
+        )
     pdf.savefig(fig)
     plt.close(fig)
 
@@ -515,6 +665,8 @@ def generate_asset_report(
     registry_path: Optional[str] = None,
     ref_shp: Optional[str] = None,
     progress_callback: Optional[Callable[[float, str], None]] = None,
+    terminal_logs: Any = None,
+    execution_results: Any = None,
 ) -> AssetReportResult:
     """基于已入库 Final TIF 生成成果 PDF 报告。
 
@@ -569,8 +721,20 @@ def generate_asset_report(
             asset_mtime = int(os.path.getmtime(tif_path))
         except Exception:
             asset_mtime = 0
+        try:
+            from report_generator import _execution_result_lines, _normalize_terminal_logs
+
+            report_input_digest = hashlib.md5(
+                (
+                    "\n".join(_normalize_terminal_logs(terminal_logs))
+                    + "\n"
+                    + "\n".join(_execution_result_lines(execution_results))
+                ).encode("utf-8", errors="replace")
+            ).hexdigest()[:10]
+        except Exception:
+            report_input_digest = ""
         dedupe_raw = hashlib.md5(
-            f"{task_id}|{asset_key}|{asset_mtime}".encode("utf-8", errors="replace")
+            f"{task_id}|{asset_key}|{asset_mtime}|{report_input_digest}".encode("utf-8", errors="replace")
         ).hexdigest()[:10]
         out_dir = output_dir or _report_dir()
         try:
@@ -605,9 +769,15 @@ def generate_asset_report(
         progress(0.48, "初始化 PDF 模板")
         plt = _configure_matplotlib()
         from matplotlib.backends.backend_pdf import PdfPages
+        extraction_summary = _collect_extraction_summary(task_id, registry_path=registry_path)
 
         with PdfPages(report_path) as pdf:
-            _render_pages(pdf, plt, task_id, asset_key, stats, preview, ref_cmp, progress)
+            _render_pages(
+                pdf, plt, task_id, asset_key, stats, preview, ref_cmp,
+                extraction_summary, progress,
+                terminal_logs=terminal_logs,
+                execution_results=execution_results,
+            )
 
         if not os.path.isfile(report_path) or os.path.getsize(report_path) <= 0:
             return AssetReportResult(

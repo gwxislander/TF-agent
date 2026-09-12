@@ -4,6 +4,9 @@ from __future__ import annotations
 import os
 import sys
 import unittest
+import importlib.util
+import tempfile
+from pathlib import Path
 
 _TF_AGENT = os.path.normpath(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "TF-agent")
@@ -48,6 +51,47 @@ class TestGlobeEngineUi(unittest.TestCase):
         self.assertLess(listener.index("if (data.version !== 1) return;"), listener.index("_parentOrigin = ev.origin"))
         self.assertLess(listener.index('if (data.channel_id !== (CFG.channelId || "default")) return;'), listener.index("_parentOrigin = ev.origin"))
         self.assertIn('if (type !== "CSTF_FLY" && type !== "CSTF_LAYER_ADD" && type !== "CSTF_LAYER_REMOVE") return;', listener)
+
+    @unittest.skipUnless(importlib.util.find_spec("rasterio"), "rasterio required")
+    def test_large_raster_gets_cached_map_preview(self):
+        """大栅格地图显示使用降采样缓存，不阻塞原始成果读取。"""
+        import numpy as np
+        import rasterio
+        from rasterio.transform import from_origin
+
+        with tempfile.TemporaryDirectory() as td:
+            source = Path(td) / "any_disagreement.tif"
+            with rasterio.open(
+                source,
+                "w",
+                driver="GTiff",
+                width=4096,
+                height=2048,
+                count=1,
+                dtype="uint8",
+                crs="EPSG:4326",
+                transform=from_origin(120, 42, 0.001, 0.001),
+                compress="lzw",
+            ) as dst:
+                dst.write(np.zeros((1, 2048, 4096), dtype=np.uint8))
+
+            preview = globe_engine.prepare_map_asset(
+                str(source), max_pixels=1_000_000, max_dimension=1024
+            )
+            self.assertTrue(preview)
+            self.assertNotEqual(os.path.normpath(str(source)), preview)
+            self.assertTrue(os.path.isfile(preview))
+            with rasterio.open(preview) as ds:
+                self.assertLessEqual(ds.width * ds.height, 1_000_000)
+                self.assertLessEqual(max(ds.width, ds.height), 1024)
+
+            # 第二次调用复用同一个缓存，不重复生成文件。
+            self.assertEqual(
+                preview,
+                globe_engine.prepare_map_asset(
+                    str(source), max_pixels=1_000_000, max_dimension=1024
+                ),
+            )
 
 
 if __name__ == "__main__":

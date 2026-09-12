@@ -141,6 +141,60 @@ class TestE1VerifyAndSummary(unittest.TestCase):
             self.assertIn("0.42", text)
             self.assertIn("师姐_2020", text)
 
+    def test_legacy_e1_asset_resolves_map_from_report_path(self):
+        """旧资产把报告路径放在 file_path 时，加载仍应找到可绘制图层。"""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            report_path = root / "E1_PIXEL_REPORT_task.json"
+            heat = root / "maps" / "disagreement_heatmap.tif"
+            heat.parent.mkdir()
+            heat.write_bytes(b"fake-raster")
+            report_path.write_text(
+                json.dumps(
+                    {
+                        "roi_name": "task",
+                        "reference": "师姐_2020",
+                        "report_path": report_path.name,
+                        "comparisons": {
+                            "pair": {
+                                "jaccard_iou": 0.5,
+                                "causal_analysis": {
+                                    "disagreement_maps": {
+                                        "heatmap": os.path.join("maps", heat.name)
+                                    }
+                                },
+                            }
+                        },
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            asset = {
+                "task": "task",
+                "method": "e1",
+                "file_path": str(report_path),
+                "report_path": str(report_path),
+            }
+            resolved = e1_agent_loop.resolve_e1_map_asset(asset)
+            self.assertEqual(resolved, os.path.normpath(str(heat)))
+
+    def test_e1_asset_prefers_explicit_map_path(self):
+        with tempfile.TemporaryDirectory() as td:
+            heat = Path(td) / "heatmap.tif"
+            heat.write_bytes(b"fake-raster")
+            report = Path(td) / "report.json"
+            report.write_text("{}", encoding="utf-8")
+            resolved = e1_agent_loop.resolve_e1_map_asset(
+                {
+                    "method": "e1",
+                    "file_path": str(report),
+                    "map_path": str(heat),
+                    "report_path": str(report),
+                }
+            )
+            self.assertEqual(resolved, os.path.normpath(str(heat)))
+
 
 class TestE1BridgeGate(unittest.TestCase):
     def _state(self, final_root: str, data_root: str, task: str = "24zhejiang1") -> dict:

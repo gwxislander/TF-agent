@@ -65,6 +65,31 @@ class TestPhaseStatusAssetLabels(unittest.TestCase):
         self.assertEqual(uil.get_asset_label("m5_change"), "变化分析结果")
         self.assertEqual(uil.get_asset_label("report"), "成果报告")
 
+    def test_asset_caption_handles_assets_without_inference_parameters(self):
+        """E1/M5/报告资产没有概率与次数参数时，成果列表仍应可展示。"""
+        caption = uil.format_asset_caption(
+            {
+                "task": "2022_5b_liaohekou1",
+                "method": "e1",
+                "created_at": "2026-09-12 10:00:00",
+                "file_size_mb": 1.25,
+            }
+        )
+        self.assertEqual(caption, "精度评价 · 2026-09-12 10:00:00 · 1.25MB")
+
+    def test_asset_caption_keeps_inference_parameter_display(self):
+        """深度学习成果仍显示概率阈值和最少次数。"""
+        caption = uil.format_asset_caption(
+            {
+                "method": "dl",
+                "prob_threshold": 0.15,
+                "min_count": 8,
+                "created_at": "2026-09-12 10:00:00",
+                "file_size_mb": 2,
+            }
+        )
+        self.assertEqual(caption, "P=0.15 C=8 · 2026-09-12 10:00:00 · 2MB")
+
 
 class TestFallback(unittest.TestCase):
     """未知键不崩溃，回退原值。"""

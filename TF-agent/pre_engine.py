@@ -7,6 +7,7 @@ os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 # 预防 single OpenMP runtime 绑定导致的性能/崩溃问题。
 os.environ.setdefault("KMP_INIT_AT_FORK", "FALSE")
 
+import gc
 import time
 import glob
 import torch
@@ -25,6 +26,21 @@ import datetime  # ✅ 新增：用于显示时间
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
+# 提高单进程可打开的文件描述符软上限。macOS 默认软上限仅 256，
+# 批量推理时每张图新建 DataLoader（含多个 worker 子进程的管道/信号量/共享内存）
+# 很容易触顶并报 OSError:[Errno 24] Too many open files。
+# 仅在 POSIX 下生效，失败则静默忽略（根因仍由 process_geotiff 内的显式清理解决）。
+try:
+    import resource
+
+    _soft, _hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    _target = _hard if _hard != resource.RLIM_INFINITY else max(_soft, 8192)
+    _target = max(_soft, min(_target, 8192))
+    if _target > _soft:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (_target, _hard))
 except Exception:
     pass
 
@@ -283,7 +299,12 @@ def process_geotiff(model, tiff_path, output_path, device, current_idx=0, total_
     overlap = 512
     stride = patch_size - overlap
     BATCH_SIZE = 16
-    NUM_WORKERS = 4
+    # macOS(spawn) 下「每张图新建多进程 DataLoader」会泄漏文件描述符：既有未回收的
+    # worker 子进程，也有每个 worker 一个 AF_UNIX socketpair；批量跑几十张后累积触顶，
+    # 报 OSError:[Errno 24] Too many open files 导致整批推理中断。
+    # 推理是计算密集型（单 batch 数十秒），切片读取 I/O 可忽略，故用单进程加载
+    # （num_workers=0）从源头消除句柄泄漏，同时省去每张图数秒的 worker 启动开销。
+    NUM_WORKERS = 0
 
     cosine_map_np = get_cosine_weights(patch_size, overlap)
     cosine_map_cuda = torch.from_numpy(cosine_map_np).to(device)
@@ -310,31 +331,57 @@ def process_geotiff(model, tiff_path, output_path, device, current_idx=0, total_
         gpu_preprocessor = GPUPreProcessor(stats, device)
         dataset = RawInferenceDataset(tiff_path, coords, patch_size)
 
-        loader = DataLoader(
-            dataset, batch_size=BATCH_SIZE, shuffle=False,
-            num_workers=NUM_WORKERS, pin_memory=True,
-            persistent_workers=True, prefetch_factor=2
-        )
+        if NUM_WORKERS > 0:
+            loader = DataLoader(
+                dataset, batch_size=BATCH_SIZE, shuffle=False,
+                num_workers=NUM_WORKERS, pin_memory=True,
+                persistent_workers=False, prefetch_factor=2
+            )
+        else:
+            # 单进程加载：无 worker 子进程 / socketpair，从根上杜绝句柄泄漏。
+            loader = DataLoader(
+                dataset, batch_size=BATCH_SIZE, shuffle=False,
+                num_workers=0, pin_memory=False
+            )
 
-        # 🚨 最关键的急刹车逻辑：每次预测一批图片前，听一下外面是否喊停
-        for raw_batch, tops, lefts in tqdm(loader, desc=f"Inference ({stitcher.mode})"):
-            if stop_callback and stop_callback():
-                print(f"\n🚨 收到中断信号！立刻终止 {os.path.basename(tiff_path)} 的 GPU 推理！")
-                return False # 返回 False 代表被中途打断
+        # 🚨 最关键的急刹车逻辑：每次预测一批图片前，听一下外面是否喊停。
+        # 🧹 try/finally 兜底清理：默认单进程加载已无 worker 可泄漏；当 NUM_WORKERS>0
+        #    或命中中断 break（迭代器未被正常耗尽）时，显式销毁迭代器/loader/dataset
+        #    并 gc，避免 macOS(spawn) 下 worker 子进程与 AF_UNIX socketpair 句柄逐张累积
+        #    触发 OSError:[Errno 24] Too many open files 而整批中断。
+        interrupted = False
+        try:
+            for raw_batch, tops, lefts in tqdm(loader, desc=f"Inference ({stitcher.mode})"):
+                if stop_callback and stop_callback():
+                    print(f"\n🚨 收到中断信号！立刻终止 {os.path.basename(tiff_path)} 的 GPU 推理！")
+                    interrupted = True  # 返回 False 代表被中途打断（先经 finally 清理再返回）
+                    break
 
-            raw_batch = raw_batch.to(device, non_blocking=True)
+                raw_batch = raw_batch.to(device, non_blocking=True)
 
-            with autocast():
-                with torch.no_grad():
-                    input_tensor = gpu_preprocessor(raw_batch)
-                    _, outputs, _ = model(input_tensor, (patch_size, patch_size))
-                    outputs = F.interpolate(outputs, size=(patch_size, patch_size),
-                                            mode="bilinear", align_corners=False)
-                    preds = torch.sigmoid(outputs).squeeze(1)
+                with autocast():
+                    with torch.no_grad():
+                        input_tensor = gpu_preprocessor(raw_batch)
+                        _, outputs, _ = model(input_tensor, (patch_size, patch_size))
+                        outputs = F.interpolate(outputs, size=(patch_size, patch_size),
+                                                mode="bilinear", align_corners=False)
+                        preds = torch.sigmoid(outputs).squeeze(1)
 
-            preds = preds.float()
-            batch_weights = cosine_map_cuda.unsqueeze(0).expand(preds.shape[0], -1, -1)
-            stitcher.add_batch(preds, batch_weights, tops, lefts)
+                preds = preds.float()
+                batch_weights = cosine_map_cuda.unsqueeze(0).expand(preds.shape[0], -1, -1)
+                stitcher.add_batch(preds, batch_weights, tops, lefts)
+        finally:
+            # 显式释放 DataLoader 的 worker 子进程及其占用的文件描述符。
+            try:
+                loader._iterator = None
+            except Exception:
+                pass
+            del loader
+            del dataset
+            gc.collect()
+
+        if interrupted:
+            return False  # 被中途打断
 
         binary = stitcher.finalize()
         with rasterio.open(output_path, "w", driver="GTiff", height=H, width=W,

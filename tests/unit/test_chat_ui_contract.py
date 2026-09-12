@@ -98,6 +98,17 @@ class TestChatUiContract(unittest.TestCase):
         self.assertIn('--cstf-status-panel-reserve', self.source)
         self.assertIn('mapPx', self.source)
 
+    def test_loading_historical_asset_restores_auto_fit(self):
+        """加载历史成果时清除上一轮 Agent 跳转视角，恢复图层范围适配。"""
+        start = self.source.index('if st.button("加载", key=f"load_{key}"')
+        end = self.source.index("st.rerun()", start)
+        block = self.source[start:end]
+        self.assertIn("st.session_state._map_prefer_center = False", block)
+
+    def test_asset_loaded_toast_checks_actual_layer_payload(self):
+        """有栅格或矢量图层但无飞行矩形时，也应报告加载成功。"""
+        self.assertIn('_lp.get("geojson") or _lp.get("imagery")', self.source)
+
     def test_resize_controls_do_not_render_sliders(self):
         """尺寸控制使用边缘拖拽，不再渲染两个可见滑块。"""
         self.assertNotIn('st.slider(\n            "状态区高度"', self.source)

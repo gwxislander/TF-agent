@@ -237,6 +237,44 @@ def get_asset_label(asset_type: str) -> str:
     return ASSET_LABELS.get(str(asset_type), str(asset_type))
 
 
+def format_asset_caption(asset: dict) -> str:
+    """格式化成果列表标题，兼容不同资产类型的可选字段。
+
+    深度学习成果包含概率/次数参数，而 E1、M5、报告和指数成果通常不包含
+    这些字段。展示层不应假设所有资产都共享同一套元数据。
+    """
+    if not isinstance(asset, dict):
+        return "成果"
+
+    kind = str(asset.get("method") or asset.get("asset_type") or "").strip().lower()
+    kind_labels = {
+        "index": "指数",
+        "e1": "精度评价",
+        "e1_evaluation": "精度评价",
+        "m5": "变化分析",
+        "m5_change": "变化分析",
+        "report": "成果报告",
+        "pdf_report": "成果报告",
+        "dataset": "卫星影像",
+    }
+    prefix = kind_labels.get(kind)
+    if prefix is None:
+        parameters = asset.get("parameters")
+        if not isinstance(parameters, dict):
+            parameters = {}
+        prob = asset.get("prob_threshold", parameters.get("prob_threshold"))
+        count = asset.get("min_count", parameters.get("count_threshold"))
+        if prob is not None or count is not None:
+            prefix = f"P={prob if prob is not None else '—'} C={count if count is not None else '—'}"
+        else:
+            prefix = "成果"
+
+    created_at = asset.get("created_at") or "未知时间"
+    file_size = asset.get("file_size_mb")
+    size_text = f"{file_size}MB" if file_size is not None else "大小未知"
+    return f"{prefix} · {created_at} · {size_text}"
+
+
 def get_map_layer_label(layer_id: str) -> str:
     """地图图层展示名；未知值原样返回。"""
     if layer_id is None:

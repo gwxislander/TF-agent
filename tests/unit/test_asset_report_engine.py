@@ -89,6 +89,53 @@ def test_get_eligible_assets_missing_file(tmp_path, monkeypatch):
     assert are.get_eligible_assets("t1") == {}
 
 
+def test_get_eligible_assets_uses_companion_tif_for_registered_shp(tmp_path, monkeypatch):
+    """深度学习历史记录登记 SHP 时，应自动使用同 stem 的 Final TIF。"""
+    tif = _make_final_tif(tmp_path / "t1_Final_p0.15_c8.tif")
+    shp = tmp_path / "t1_Final_p0.15_c8.shp"
+    shp.write_bytes(b"placeholder")
+    reg = tmp_path / "assets_registry.json"
+    reg.write_text(
+        json.dumps({
+            "t1_p0.15_c8": {
+                "task": "t1",
+                "prob_threshold": 0.15,
+                "min_count": 8,
+                "file_path": str(shp),
+                "created_at": "2026-01-01 00:00:00",
+            }
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(are, "_default_registry_path", lambda: str(reg))
+
+    eligible = are.get_eligible_assets("t1")
+    assert set(eligible) == {"t1_p0.15_c8"}
+    assert eligible["t1_p0.15_c8"]["file_path"] == str(tif)
+
+
+def test_collect_extraction_summary_includes_complete_assets(tmp_path, monkeypatch):
+    tif = _make_final_tif(tmp_path / "t1_Final_p0.15_c8.tif")
+    shp = tmp_path / "t1_Final_p0.15_c8.shp"
+    shp.write_bytes(b"placeholder")
+    reg = tmp_path / "assets_registry.json"
+    reg.write_text(json.dumps({
+        "t1_p0.15_c8": {
+            "task": "t1", "method": "deep_learning", "prob_threshold": 0.15,
+            "min_count": 8, "file_path": str(shp),
+            "created_at": "2026-01-01 00:00:00",
+        }
+    }), encoding="utf-8")
+    monkeypatch.setattr(are, "_default_registry_path", lambda: str(reg))
+
+    summary = are._collect_extraction_summary("t1")
+    assert summary["status"] == "complete"
+    assert summary["primary_tif"] == str(tif)
+    assert summary["primary_shp"] == str(shp)
+    assert summary["parameters"]["prob_threshold"] == 0.15
+    assert summary["assets"][0]["format"] == "tif"
+
+
 def test_get_eligible_assets_rejects_empty_final_file(tmp_path, monkeypatch):
     empty = tmp_path / "t1_Final_empty.tif"
     empty.touch()
@@ -142,6 +189,31 @@ def test_generate_asset_report_progress_callback(_tmp_registry, tmp_path, monkey
     assert res.success is True
     assert seen and seen[-1][0] == 1.0
     assert any(p > 0.5 for p, _ in seen)
+
+
+def test_monitor_report_includes_terminal_results(_tmp_registry, tmp_path, monkeypatch):
+    """监测报告也应保留终端中的关键运行结果，便于复核提取过程。"""
+    monkeypatch.setattr(are, "_report_dir", lambda: str(tmp_path))
+    captured = {}
+    original_render = are._render_pages
+
+    def capture_render(*args, **kwargs):
+        captured["terminal_logs"] = kwargs.get("terminal_logs")
+        captured["execution_results"] = kwargs.get("execution_results")
+        return original_render(*args, **kwargs)
+
+    monkeypatch.setattr(are, "_render_pages", capture_render)
+    res = are.generate_asset_report(
+        "20fujian1",
+        terminal_logs=[
+            "📊 Top-10 参数组合排行榜:",
+            "🏆 最优参数: prob=0.15, cnt=8 | IoU=72.97% F1=84.37%",
+            "✅ 自适应优化完成！耗时 61.4s",
+        ],
+    )
+    assert res.success is True
+    assert captured["terminal_logs"][0].startswith("📊 Top-10")
+    assert captured["execution_results"] is None
 
 
 def test_dedupe_same_asset(_tmp_registry, tmp_path, monkeypatch):

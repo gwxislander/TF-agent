@@ -10,6 +10,7 @@ import tempfile
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -416,8 +417,6 @@ class _GlobeHandler(BaseHTTPRequestHandler):
             self._send(200, b"ok", "text/plain; charset=utf-8")
             return
         if path == "/api/map/ack":
-            import urllib.parse
-
             q = {}
             for part in query.split("&"):
                 if "=" in part:

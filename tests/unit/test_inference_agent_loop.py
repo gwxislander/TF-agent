@@ -573,6 +573,32 @@ class TestExecuteFailure(unittest.TestCase):
             self.assertFalse(result["success"])
             self.assertIn("中断", result["error"])
 
+    def test_stop_event_set_after_postprocess_cancels_before_success(self):
+        """后处理返回成功后才收到停止请求，也不得继续报告/提交成功。"""
+        import threading
+
+        with tempfile.TemporaryDirectory() as td:
+            plan, *_ = _happy_plan(Path(td))
+            stop = threading.Event()
+            base_post = FakePostEngine()
+
+            class LateStopPost:
+                def generate_double_constraint_complete(self, *args, **kwargs):
+                    result = base_post.generate_double_constraint_complete(*args, **kwargs)
+                    stop.set()
+                    return result
+
+            result = ial.execute_local_inference(
+                plan,
+                stop_event=stop,
+                pre_engine_mod=FakePreEngine(),
+                post_engine_mod=LateStopPost(),
+            )
+
+            self.assertFalse(result["success"])
+            self.assertEqual(result["status"], "cancelled")
+            self.assertIn("中断", result["error"])
+
 
 # ===============================================================
 #  13 / 14 / 15 / 16 / 17：验证与登记

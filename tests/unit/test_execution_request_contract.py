@@ -132,6 +132,69 @@ class TestExecutionRequestContract(unittest.TestCase):
         self.assertIn('"精度评价校验通过" if _e1_ok', generic_finalize)
         self.assertIn("_optional_postflight_warning", generic_finalize)
 
+    def test_background_workers_honor_stop_before_verify_and_register(self):
+        """停止信号在引擎返回后到达时，后台 worker 也不得继续登记成果。"""
+        source = (Path(__file__).parents[2] / "TF-agent" / "app.py").read_text(encoding="utf-8")
+        for worker_name, verify_marker, register_marker in (
+            ("_inference_worker_entry", "verify_inference_outputs", "register_inference_asset"),
+            ("_gee_worker_entry", "verify_gee_outputs", "register_gee_dataset_asset"),
+            ("run_m5_sync", "verify_m5_outputs", "register_m5_asset"),
+            ("run_e1_sync", "verify_e1_outputs", "register_e1_asset"),
+        ):
+            start = source.index(f"def {worker_name}")
+            end = source.find("\ndef ", start + 5)
+            block = source[start:end if end >= 0 else len(source)]
+            verify_idx = block.index(verify_marker)
+            register_idx = block.index(register_marker)
+            prefix = block[:verify_idx]
+            self.assertIn("stop_event.is_set()", prefix, worker_name)
+            self.assertIn("stop_event.is_set()", block[verify_idx:register_idx], worker_name)
+
+    def test_modern_inference_carries_and_runs_optional_e1_m5(self):
+        """现代推理入口不能丢弃侧栏的 E1/M5 设置。"""
+        source = (Path(__file__).parents[2] / "TF-agent" / "app.py").read_text(encoding="utf-8")
+        start = source.index("def _inference_worker_entry")
+        end = source.index("\ndef _gee_worker_entry", start)
+        worker = source[start:end]
+        for marker in ("_run_m5_phase(", "_run_e1_phase(", "postflight_ctx"):
+            self.assertIn(marker, worker)
+
+        modern_start = source.index("# 本地潮滩推理可信执行闭环")
+        modern_end = source.index("# GEE 影像下载可信执行闭环", modern_start)
+        modern_ctx = source[modern_start:modern_end]
+        for key in (
+            '"task_aoi_shp"', '"m5_enabled"', '"m5_baseline_shp"',
+            '"e1_enabled"', '"e1_data_root"', '"e1_reference"',
+            '"e1_compare_sources"', '"e1_export_maps"', '"e1_export_heatmap"',
+        ):
+            self.assertIn(key, modern_ctx)
+
+    def test_stop_button_persists_cancel_request_until_worker_finishes(self):
+        """UI 中断必须立即写入账本并显示等待安全退出，而不是只弹一次 toast。"""
+        source = (Path(__file__).parents[2] / "TF-agent" / "app.py").read_text(encoding="utf-8")
+        start = source.index('stop_btn = st.button(')
+        end = source.index('if tune_btn', start)
+        stop_block = source[start:end]
+        self.assertIn('st.session_state.stop_requested = True', stop_block)
+        self.assertIn('_job_transition(', stop_block)
+        self.assertIn('"CANCELLED"', stop_block)
+        self.assertIn('正在等待当前阶段安全退出', source)
+
+    def test_late_finalizer_does_not_overwrite_reconciled_interrupted_job(self):
+        """进程重启后的 INTERRUPTED 账本不能被旧 worker 改写成 FAILED。"""
+        source = (Path(__file__).parents[2] / "TF-agent" / "app.py").read_text(encoding="utf-8")
+        start = source.index("def _job_transition")
+        end = source.index("\ndef _job_progress_update", start)
+        transition = source[start:end]
+        self.assertIn("TERMINAL_STATUSES", transition)
+        self.assertIn("current.status in TERMINAL_STATUSES", transition)
+
+    def test_e1_engine_receives_cooperative_stop_callback(self):
+        """E1 分块比较需把停止回调传入引擎，避免只能等整轮评价完成。"""
+        source = (Path(__file__).parents[2] / "TF-agent" / "e1_engine.py").read_text(encoding="utf-8")
+        call = source[source.index("result = e1.run_pixel_comparison("):]
+        self.assertIn("stop_callback=stop_callback", call)
+
     def test_compatibility_framework_has_no_production_importers(self):
         """历史框架可保留给旧数据读取，但不能成为新的生产入口。"""
         app_dir = Path(__file__).parents[2] / "TF-agent"

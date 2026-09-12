@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Tuple
 
 _OPTIONAL_TEXT_FIELDS = frozenset(
     {
-        "task", "method", "file_path", "report_path", "report_md_path",
+        "task", "method", "file_path", "map_path", "report_path", "report_md_path",
         "loss_shp", "siltation_shp", "baseline_task", "alert_level",
         "reference", "workflow_id", "asset_id", "plan_id", "asset_type",
         "created_at", "status", "code_commit", "device", "model_id",

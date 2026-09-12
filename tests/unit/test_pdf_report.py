@@ -117,6 +117,99 @@ def test_no_abs_path_in_assets(_tmp_report_dir):
     assert res.success is True
 
 
+def test_report_accepts_complete_extraction_asset_metadata(_tmp_report_dir):
+    """成果报告应保留 TIF/SHP、参数、状态和大小等提取结果摘要。"""
+    res = rg.generate_task_report(
+        _task_ctx(),
+        timeline=_timeline(),
+        assets=[{
+            "path": "/tmp/task_Final_p0.15_c8.tif", "kind": "prediction",
+            "status": "verified", "file_size_mb": 12.5,
+            "prob_threshold": 0.15, "min_count": 8,
+            "model_id": "cdnet_resnet50", "weight_id": "best.pth",
+        }],
+    )
+    assert res.success is True
+
+
+def test_report_includes_terminal_results_and_structured_autotune_metrics(_tmp_report_dir):
+    """报告应携带终端关键结果及 AutoTune 的最佳参数/Top-10 指标。"""
+    terminal_logs = [
+        "📊 Top-10 参数组合排行榜:",
+        "  1  0.15  8  72.97  84.37  79.63  89.72 🏆",
+        "🏆 最优参数: prob=0.15, cnt=8",
+        "   IoU=72.97% F1=84.37% Precision=79.63% Recall=89.72%",
+        "✅ 自适应优化完成！耗时 61.4s",
+    ]
+    execution_results = {
+        "autotune": {
+            "best_prob": 0.15,
+            "best_cnt": 8,
+            "best_iou": 0.7297,
+            "best_f1": 0.8437,
+            "best_precision": 0.7963,
+            "best_recall": 0.8972,
+            "total_trials": 500,
+            "total_time_sec": 61.4,
+            "trials": [
+                {
+                    "prob": 0.15, "cnt": 8, "iou": 0.7297, "f1": 0.8437,
+                    "precision": 0.7963, "recall": 0.8972,
+                },
+            ],
+        },
+    }
+    res = rg.generate_task_report(
+        _task_ctx(task_id="terminal-results"),
+        timeline=_timeline(),
+        terminal_logs=terminal_logs,
+        execution_results=execution_results,
+    )
+    assert res.success is True
+    assert "终端运行结果" in res.sections
+    result_text = "\n".join(rg._execution_result_lines(execution_results))
+    assert "Top-10" in result_text
+    assert "0.15" in result_text
+    assert "72.97%" in result_text
+    assert "84.37%" in result_text
+    assert "61.4" in result_text
+    normalized_logs = rg._normalize_terminal_logs(terminal_logs)
+    assert normalized_logs[0].startswith("Top-10")
+    assert normalized_logs[-1].endswith("耗时 61.4s")
+
+
+def test_execution_result_lines_include_nested_m5_and_e1_metrics():
+    """变化分析/精度评价的嵌套指标也应进入报告摘要。"""
+    lines = rg._execution_result_lines({
+        "m5": {
+            "alert_level": "YELLOW",
+            "diagnostic_message": "面积变化需复核",
+            "quantitative_metrics": {
+                "area_evolution": {
+                    "baseline_area_km2": 12.3,
+                    "current_area_km2": 13.1,
+                    "change_rate_percentage": 6.5,
+                },
+                "centroid_trajectory": {
+                    "drift_distance_meters": 84.2,
+                    "migration_azimuth_degrees": 31.0,
+                },
+            },
+        },
+        "e1": {
+            "reference": "师姐_2020",
+            "comparisons": {
+                "FCS30": {"jaccard_iou": 0.42, "intersection_km2": 2.1},
+            },
+        },
+    })
+    result_text = "\n".join(lines)
+    assert "基线=12.3 km²" in result_text
+    assert "变化率=6.5%" in result_text
+    assert "IoU=42.00%" in result_text
+    assert "师姐_2020" in result_text
+
+
 def test_posix_path_and_spatial_metadata_are_redacted():
     """报告文本不得持久化 POSIX 路径或精确空间字段。"""
     text = rg._sanitize_text("failed /Users/chl/private/result.tif bbox=[120,30,120.1,30.1]")
